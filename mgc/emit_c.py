@@ -84,7 +84,7 @@ class Emitter:
     """Prints a fully lowered IR module as a C test function body.
 
     Mostly a 1:1 printer: each op becomes the statement(s) it describes, e.g.
-    `mg.dma` -> `mg_idma_memcpy_2d(...)`, `mg.hwpe` -> `mg_redmule_gemm(...)`,
+    `mg.idma` -> `mg_idma_memcpy_2d(...)`, `mg.hwpe` -> `mg_redmule_gemm(...)`,
     `mg.wait` -> `mg_idma_wait(...)`, `mg.if` -> `if (...) {...}`. It then
     adds the file header, includes and the declarations (rotating pointers,
     events, neighbour bases) that the passes made necessary. Use `emit()`.
@@ -164,8 +164,8 @@ class Emitter:
             self.if_(op)
         elif isinstance(op, ir.ContinueOp):
             w.line('continue;')
-        elif isinstance(op, ir.DmaOp):
-            self.dma(op)
+        elif isinstance(op, ir.IdmaOp):
+            self.idma(op)
         elif isinstance(op, ir.HwpeOp):
             self.hwpe(op)
         elif isinstance(op, ir.CallOp):
@@ -244,31 +244,58 @@ class Emitter:
         for k, a in enumerate(op.addrs.data):
             slot = f'l1_addr_{n}' if depth == 1 else f'l1_addr_{n}_{k}'
             w.line(f'uint32_t {slot} = {a.data.c()};')
-        w.line(f'uint32_t l2_addr_{n} = {op.axi.data.c()};')
+        if op.axi is not None:
+            w.line(f'uint32_t l2_addr_{n} = {op.axi.data.c()};')
 
-    def dma(self, op):
+    def idma(self, op):
         """Print an iDMA call, e.g.
         `mg_idma_memcpy_2d(&idma_ctrl, &eu_ctrl, WAIT_MODE, 0, axi, obi, len_x, std_x, reps_x, &evt, NULL);`
-        For neighbour stores the L2 side is the neighbour's L1 address."""
+        For remote stores the L2 (AXI) side is the other tile's L1 address: a
+        neighbour base (`l1_base_s`), `get_l1_base(GET_ID(y, x))` for absolute
+        tile ids, or the native multicast function for `row`/`col` targets
+        (non-native multicasts were lowered to unicasts by `idma-mcast`)."""
         a = alloc_of(op.local)
         n = a.sym.data
         x: ir.Xfer = op.xfer.data
         if x.rank not in devices.IDMA.functions:
             raise MgcError(op, f'no mglib function for {x.rank}-D transfers')
+        fn = devices.IDMA.functions[x.rank]
         if op.remote is not None:
-            base = op.remote.owner.base.data
-            axi = f'{base} + ({op.addr.data} - l1_tile_base)'
-            geo = [x.len.c()]
+            r = op.remote.owner
+            mode = r.mode.data
+            if mode == 'rel':
+                base = r.base.data
+            elif mode == 'abs':
+                base = f'get_l1_base(GET_ID({r.ty.data.c()}, {r.tx.data.c()}))'
+            elif mode.upper() in devices.IDMA.multicast:
+                # the hardware writes the same L1 offset on every tile of the row/column
+                base, fn = None, devices.IDMA.multicast[mode.upper()]
+            else:
+                raise MgcError(op, f'internal: {mode} multicast was not lowered')
+            if r.view is None:
+                dst = op.addr.data
+                geo = [x.len.c()]
+            else:
+                # a block of another buffer: its address plus the block's byte offset
+                dst = f'l1_addr_{alloc_of(op.remote).sym.data}'
+                if not is_zero(op.axi.data):
+                    dst += f' + ({op.axi.data.c()})'
+                geo = [x.len.c()] + [e.c() for reps, std in x.outer for e in (std, reps)]
+            axi = dst if base is None else f'{base} + ({dst} - l1_tile_base)'
         else:
             axi = op.axi.data.c()
             geo = [f'len_{n}']
             for d in range(len(x.outer)):
                 sfx = '' if d == 0 else str(d + 1)
                 geo += [f'std{sfx}_{n}', f'reps{sfx}_{n}']
-        args = ['&idma_ctrl', '&eu_ctrl', WAIT_MODE, str(op.dir.data), axi, op.addr.data] + geo
+        obi = op.addr.data
+        if op.obi is not None and not is_zero(op.obi.data):
+            # a block of the local buffer
+            obi += f' + ({op.obi.data.c()})'
+        args = ['&idma_ctrl', '&eu_ctrl', WAIT_MODE, str(op.dir.data), axi, obi] + geo
         args += [op.event.data.cname, 'NULL']
         self.w.blank()
-        self.w.call(devices.IDMA.functions[x.rank], args)
+        self.w.call(fn, args)
 
     def hwpe(self, op):
         """Print one accelerator protocol step: `mg_redmule_gemm_commit(ctrl);` or
@@ -296,7 +323,7 @@ class Emitter:
     def wait(self, op):
         """Print the wait matching the event: `mg_idma_wait(...)` or `mg_redmule_wait(...)`."""
         e = op.event.data
-        if e.kind == 'dma':
+        if e.kind == 'idma':
             self.w.line(f'mg_idma_wait(&eu_ctrl, {e.dir}, {WAIT_MODE}, {e.cname});')
         else:
             acc = e.name if e.kind == 'hwpe' else self.evkinds[e.name]
@@ -404,13 +431,13 @@ class Emitter:
         names = {}
         for o in self.m.walk():
             ev = o.attributes.get('event')
-            if isinstance(ev, ir.EvtAttr) and ev.data.kind in ('dma', 'hwpe'):
+            if isinstance(ev, ir.EvtAttr) and ev.data.kind in ('idma', 'hwpe'):
                 names.setdefault(ev.data.cname[1:], ev.data)
         names = list(names.items())
-        dma = sorted({nm for nm, e in names if e.kind == 'dma'},
+        idma = sorted({nm for nm, e in names if e.kind == 'idma'},
                      key=lambda nm: (order.index(next(e.name for x, e in names if x == nm)), nm))
-        if dma:
-            d.append(f'{ind}mg_event_t ' + ', '.join(dma) + ';')
+        if idma:
+            d.append(f'{ind}mg_event_t ' + ', '.join(idma) + ';')
         for nm in dict.fromkeys(nm for nm, e in names if e.kind == 'hwpe'):
             d.append(f'{ind}mg_event_t {nm};')
         for o in self.m.walk():
@@ -422,7 +449,7 @@ class Emitter:
                     d.append(f'{ind}mg_event_t ' + ', '.join(f'*{ptr_name("evt", n, k)}' for k in ks) + ';')
         bases = {}
         for o in self.m.walk():
-            if isinstance(o, ir.RemoteOp):
+            if isinstance(o, ir.RemoteOp) and o.mode.data == 'rel':
                 bases[o.base.data] = (o.dy.data.value(), o.dx.data.value())
         for nm, (dy, dx) in bases.items():
             off = ''

@@ -16,7 +16,8 @@ Check (dataflow over the region tree, states none/pending/maybe):
 * waiting on storage that was certainly never issued is an error.
 `maybe` (only on some paths, e.g. under correlated `if`s) is accepted, so
 the check never rejects a correct program; loops are analysed twice, with
-event-array slots rotated across the back edge.
+event-array slots rotated across the back edge (a wait on `ev[v - 1]`, issued
+by the previous iteration, is checked in the second walk).
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ class _Analysis:
         self.overlap = set()
         self.loops = []  # loop variables, innermost last
         self.cont = []  # states at `continue`, per loop
+        self.first = set()  # loops in their first walk: slots `v - k` may come from the previous iteration
 
     def key(self, e: ir.EvtRef, op):
         """Canonical identity of the storage `e` names (array slots are
@@ -75,16 +77,16 @@ class _Analysis:
 
     def note(self, st):
         """Record buffers whose load and store events are pending at once."""
-        bufs = {k[1] for k, v in st.items() if k[0] == 'dma' and v != N}
+        bufs = {k[1] for k, v in st.items() if k[0] == 'idma' and v != N}
         for b in bufs:
-            if st.get(('dma', b, 0), N) != N and st.get(('dma', b, 1), N) != N:
+            if st.get(('idma', b, 0), N) != N and st.get(('idma', b, 1), N) != N:
                 self.overlap.add(b)
 
     def issue(self, op, st, e):
         """Mark `e` pending in `st`; error if it already certainly is."""
         k = self.key(e, op)
         if st.get(k, N) == P:
-            what = f'`{e.name}`' + (' (out)' if e.dir == 1 else '') if e.kind == 'dma' else f'`{e.name}`'
+            what = f'`{e.name}`' + (' (out)' if e.dir == 1 else '') if e.kind == 'idma' else f'`{e.name}`'
             raise MgcError(op, f'a previous transfer/job on {what} was not waited before reusing its event')
         st[k] = P
         self.note(st)
@@ -94,7 +96,7 @@ class _Analysis:
         block always ends in `continue`). `if` branches are merged, loops are
         walked twice to catch events left pending across iterations."""
         for op in ops:
-            if isinstance(op, ir.DmaOp):
+            if isinstance(op, ir.IdmaOp):
                 self.issue(op, st, op.event.data)
             elif isinstance(op, ir.HwpeOp) and op.action.data in ('enqueue', 'oneshot'):
                 self.issue(op, st, op.event.data)
@@ -102,7 +104,7 @@ class _Analysis:
                 self.issue(op, st, op.event.data)
             elif isinstance(op, ir.WaitOp):
                 k = self.key(op.event.data, op)
-                if st.get(k, N) == N:
+                if st.get(k, N) == N and not (k[0] == 'arr' and k[2] in self.first):
                     raise MgcError(op, f'wait on an event that was never issued (`{op.event.data.name}`)')
                 st[k] = N
             elif isinstance(op, ir.IfOp):
@@ -123,7 +125,9 @@ class _Analysis:
                         entry[k] = v
                 self.loops.append(var)
                 self.cont.append([])
+                self.first.add(var)
                 s1 = self.run(op.body.block.ops, dict(entry))
+                self.first.discard(var)
                 for c in self.cont[-1]:
                     s1 = _merge(s1, c)
                 self.cont[-1] = []
@@ -170,7 +174,7 @@ class EventAlloc(ModulePass):
         an.run(tiles.body.block.ops, {})
 
         def cname(e: ir.EvtRef):
-            if e.kind == 'dma':
+            if e.kind == 'idma':
                 base = f'idma_evt_{e.name}'
                 if e.name in an.overlap:
                     base += '_in' if e.dir == 0 else '_out'

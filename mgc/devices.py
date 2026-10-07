@@ -5,7 +5,8 @@
 # Francesco Conti <f.conti@unibo.it>
 """Hardware descriptions: the only place passes learn what the hardware can do.
 
-* Adding an iDMA mode (3-D, 4-D, strided L1, ...) means editing `IDMA`.
+* Adding an iDMA mode (3-D, 4-D, strided L1, hardware multicast, ...) means
+  editing `IDMA`.
 * Adding an HWPE accelerator means adding an `Hwpe` entry (and its mglib
   wrapper); no pass changes.
 """
@@ -24,7 +25,7 @@ from typing import Dict, Tuple
 class IdmaCaps:
     """What one iDMA transfer can do, as exposed by mglib.
 
-    `legalize-dma` uses it to decide whether a tensor view maps to a transfer.
+    `legalize-idma` uses it to decide whether a tensor view maps to a transfer.
     With the default `IDMA` below (rank 2, dense L1), a 2-D tile of a larger
     matrix is one `mg_idma_memcpy_2d` (rows x contiguous), a full-width block of
     rows collapses to one `mg_idma_memcpy_1d`, and anything needing a third
@@ -33,6 +34,10 @@ class IdmaCaps:
     max_rank: int  # dimensions of one transfer (1 = contiguous, 2 = rows x contiguous, ...)
     l1_strided: bool  # can the L1 (OBI) side be strided? (mglib: no)
     functions: Dict[int, str]  # rank -> mglib function
+    # multicast scope ('ROW' | 'COL') -> mglib function for a native L1 -> L1
+    # multicast (same arguments as the 1-D unicast). Scopes not listed are
+    # lowered by `idma-mcast` to one unicast transfer per destination tile.
+    multicast: Dict[str, str] = field(default_factory=dict)
 
 
 IDMA = IdmaCaps(max_rank=2, l1_strided=False,

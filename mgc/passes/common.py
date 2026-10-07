@@ -56,8 +56,8 @@ def alloc_of(value) -> ir.AllocOp:
 
 
 def esize(alloc: ir.AllocOp, ts) -> int:
-    """Element size in bytes of the buffer, taken from its source tensor (`ts` = `tensors()`)."""
-    return DTYPES[ts[alloc.view.data.tensor].dtype][1]
+    """Element size in bytes of the buffer, from its dtype (`ts` = `tensors()`, unused)."""
+    return DTYPES[alloc.dtype.data][1]
 
 
 def shape(alloc: ir.AllocOp) -> List[Expr]:

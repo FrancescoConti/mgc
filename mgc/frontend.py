@@ -20,12 +20,12 @@ Input (abridged `.mgc`)::
     @test("demo")
     def main():
         for y_id, x_id in tiles():
-            x = L1.alloc(X[0:8, 0:8])
-            dma.load(x, X[0:8, 0:8]).wait()
+            x = L1.single_buffer(X[0:8, 0:8])
+            idma.load(x, X[0:8, 0:8]).wait()
 
 Output: an xDSL `ModuleOp` holding one `mg.tensor` per `l2()`, one `mg.define`
 per `define()`, one `mg.kernel` per `l1_kernel()`, and a `mg.func` whose body
-is a `mg.tiles` op containing the per-tile code (`mg.alloc`, `mg.dma`, ...).
+is a `mg.tiles` op containing the per-tile code (`mg.alloc`, `mg.idma`, ...).
 
 How it works: module-level declarations and the function are walked once; every Python
 name is bound in `Frontend.env` to a compile-time value (`Sym`/`Expr` for
@@ -138,10 +138,11 @@ class Split:
 
 @dataclass(eq=False)
 class Buf:
-    """An L1 buffer from `L1.alloc(view)` (depth 1) or `L1.multi_buffer(view, depth=N)`.
+    """An L1 buffer from `L1.single_buffer(view)` (depth 1) or `L1.multi_buffer(view, depth=N)`.
 
     `value` is the SSA value of the `mg.alloc` op, `view` the L2 view that fixed
-    its shape and `depth` the number of slots.
+    its shape (tensorless for `L1.single_buffer((d0, d1), dtype)`) and `depth`
+    the number of slots.
     """
     name: str
     value: object  # SSA value of the mg.alloc
@@ -151,10 +152,16 @@ class Buf:
 
 @dataclass(eq=False)
 class Remote:
-    """`buf.on(dy, dx)`: the copy of `buf` in the L1 of tile `(y_id+dy, x_id+dx)`."""
+    """The copy of `buf` in the L1 of other tile(s), by `mode`:
+
+    - `buf.at_rel(dy, dx)` (`rel`): tile `(y_id + dy, x_id + dx)`, `a, b` = `dy, dx`;
+    - `buf.at(y, x)` (`abs`): tile `(y, x)`, `a, b` = `y, x`;
+    - `buf.row` / `buf.col` (`row` / `col`): every other tile of this row / column.
+    """
     buf: Buf
-    dy: Expr
-    dx: Expr
+    mode: str  # 'rel' | 'abs' | 'row' | 'col'
+    a: Optional[Expr] = None
+    b: Optional[Expr] = None
 
 
 @dataclass(eq=False)
@@ -165,6 +172,28 @@ class Slot:
     """
     buf: object  # Buf | Remote
     index: Expr
+
+
+@dataclass(eq=False)
+class RemoteView:
+    """A block of a single-slot buffer on other tile(s), `buf.at(y, x)[r, :]`.
+
+    `view` selects elements of the buffer (tensorless `ir.View` over its shape),
+    e.g. `[r, 0:+tile_h]` (first dimension dropped) for `rowms.at(y_id, 0)[r, :]`.
+    """
+    remote: Remote
+    view: ir.View
+
+
+@dataclass(eq=False)
+class LocalView:
+    """A block of a local single-slot buffer, `buf[r, :]`.
+
+    `view` selects elements of the buffer as in `RemoteView`, e.g. `[0, 0:+tile_h]`
+    for `rowms[0, :]`. Only the source of a store into a block of another buffer.
+    """
+    buf: object  # Buf
+    view: ir.View
 
 
 @dataclass(eq=False)
@@ -277,6 +306,7 @@ class Frontend:
         }
         self.module_ops = []
         self.blocks: List[Block] = []
+        self.in_pipeline = False
 
     # -- building ------------------------------------------------------------
     def add(self, op, node=None):
@@ -471,7 +501,7 @@ class Frontend:
         - bare name -> whatever it is bound to (`Tensor`, `Buf`, `Split`, ...);
           tile axes (`y_id`) evaluate to their run-time variable;
         - `h.start` / `h.size` -> `Expr` for a tile split;
-        - `b.on(dy, dx)` -> `Remote`; `b[i]` -> `Slot`; `ev[i]` -> event ref;
+        - `b.at_rel(dy, dx)`, `b.at(y, x)`, `b.row`, `b.col` -> `Remote`; `b[i]` -> `Slot`; `ev[i]` -> event ref;
         - `X[a:b, h]` -> `ir.View` (see `view()`);
         - comparisons / `and` / `or` / `not` -> condition `Expr`.
 
@@ -504,20 +534,29 @@ class Frontend:
             v = self.ev(n.value)
             if isinstance(v, Split) and n.attr in ('start', 'size'):
                 return getattr(v, n.attr)
+            if isinstance(v, Buf) and n.attr in ('row', 'col'):
+                return Remote(v, n.attr)
             raise MgcError(n, f'unknown attribute .{n.attr}')
         if isinstance(n, ast.Call):
             obj, fn = _call_parts(n)
             if fn == 'on' and obj is not None:
+                raise MgcError(n, '`buf.on(dy, dx)` was renamed `buf.at_rel(dy, dx)`')
+            if fn in ('at_rel', 'at') and obj is not None:
                 b = self.ev(obj)
                 if not isinstance(b, Buf) or len(n.args) != 2:
-                    raise MgcError(n, '`buf.on(dy, dx)` names an L1 buffer on a neighbour tile')
-                return Remote(b, self.expr(n.args[0]), self.expr(n.args[1]))
+                    raise MgcError(n, '`buf.at_rel(dy, dx)` / `buf.at(y, x)` name an L1 buffer on another tile')
+                mode = 'rel' if fn == 'at_rel' else 'abs'
+                return Remote(b, mode, self.expr(n.args[0]), self.expr(n.args[1]))
             raise MgcError(n, f'`{ast.unparse(n)}` is not an expression')
         if isinstance(n, ast.Subscript):
             v = self.ev(n.value)
             idx = n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]
             if isinstance(v, Tensor):
                 return self.view(n, v, idx)
+            if isinstance(v, Remote) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
+                return self.remote_view(n, v, idx)
+            if isinstance(v, Buf) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
+                return LocalView(v, self.block_view(n, v, idx))
             if isinstance(v, (Buf, Remote, EvArray)):
                 if len(idx) != 1:
                     raise MgcError(n, 'multi-buffers and event arrays take a single index')
@@ -591,6 +630,26 @@ class Frontend:
                     raise MgcError(i, 'index must be an integer, a slice or a tile split')
         return ir.View(t.pyname, starts, sizes, kept)
 
+    def remote_view(self, n, r: Remote, idx) -> RemoteView:
+        """`b.at(y, x)[i, j, ...]`: a block of single-slot buffer `b` on other tile(s).
+
+        Indices follow `view()` (a slice, or an integer that drops the dimension),
+        over the buffer's shape. For `rowms` of shape (MESH_X_TILES, tile_h),
+        `rowms.at(y_id, 0)[x_id, :]` is row `x_id`: starts `[x_id, 0]`, sizes
+        `[1, tile_h]`, view shape `[tile_h]`. A single slice index (`b.at(...)[0:4]`)
+        also makes a view; a single integer is a slot (`b.at(...)[k]`).
+        """
+        return RemoteView(r, self.block_view(n, r.buf, idx, ' on another tile'))
+
+    def block_view(self, n, b, idx, where='') -> ir.View:
+        """The tensorless `ir.View` selecting `b[idx...]` over the shape of
+        single-slot buffer `b` (indices as in `view()`)."""
+        if b.depth != 1:
+            raise MgcError(n, f'a block of `{b.name}`{where} needs a single-slot buffer')
+        t = Tensor(b.name, None, b.view.shape, b.value.owner.dtype.data)
+        v = self.view(n, t, idx)
+        return ir.View(None, v.starts, v.sizes, v.kept)
+
     # -- statements ----------------------------------------------------------
     def flush_comments(self, s):
         """Emit IR comment ops for standalone `#` lines found between the last
@@ -620,7 +679,7 @@ class Frontend:
 
         Dispatches on the kind: docstring/`comment()` -> comment op;
         `x: u8 = e` / `x = e` / `x += e` -> scalar (`scalar()`); other
-        assignments -> `assign()`; bare calls (`dma.load(...)`, `sync(ROW)`,
+        assignments -> `assign()`; bare calls (`idma.load(...)`, `sync(ROW)`,
         `check(...)`) -> `action()`; `for` -> `loop()`; `if` -> `mg.if`;
         `continue`; `pass`. Anything else is an `MgcError`.
         """
@@ -688,9 +747,9 @@ class Frontend:
         """Plain `name = <call or expr>` inside the tile loop. The right side picks the meaning:
 
         - `y_id.split(E)` -> tile split (`mg.split`);
-        - `L1.alloc(view)` / `L1.multi_buffer(view, depth=N)` -> L1 buffer (`alloc()`);
+        - `L1.single_buffer(view | (d0, ...), dtype)` / `L1.multi_buffer(..., depth=N)` -> L1 buffer (`alloc()`);
         - `redmule.events(n)` -> event array (`mg.events`);
-        - `dma.load/store(...)`, `redmule.gemm(...)`, `kernel(...)` -> the name is
+        - `idma.load/store(...)`, `redmule.gemm(...)`, `kernel(...)` -> the name is
           bound to the returned event, so `e.wait()` works later;
         - anything else -> integer scalar (`scalar()`).
         """
@@ -708,7 +767,7 @@ class Frontend:
             self.env[name] = sp
             self.add(ir.SplitOp.create(attributes={'sym': StringAttr(name), 'axis': StringAttr(ax.axis),
                                                    'extent': ir.E(sp.extent)}), s)
-        elif (on, fn) in (('L1', 'alloc'), ('L1', 'multi_buffer')):
+        elif (on, fn) in (('L1', 'single_buffer'), ('L1', 'multi_buffer')):
             self.alloc(s, name, fn)
         elif fn == 'events' and on in devices.HWPES:
             n = const_of(self.expr(s.value.args[0])) if s.value.args else None
@@ -720,22 +779,36 @@ class Frontend:
                                                     'kind': StringAttr(on)}), s)
         elif fn == 'cores':
             raise MgcError(s, 'cores() is reserved (level 3, intra-tile parallelism) and not implemented yet')
-        elif on in ('dma',) or on in devices.HWPES or isinstance(self.env.get(fn), Kernel):
+        elif on in ('idma', 'dma') or on in devices.HWPES or isinstance(self.env.get(fn), Kernel):
             self.env[name] = self.action(s.value, s)
         else:
             self.scalar(s, tgt, s.value, None)
 
     def alloc(self, s, name, kind):
-        """`b = L1.alloc(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
+        """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
 
         The view argument only provides the buffer's shape (and transfer
-        geometry); no data moves. Emits `mg.alloc` and binds `name` to a `Buf`
-        with `depth` slots (1 for `alloc`, >= 2 for `multi_buffer`).
+        geometry); no data moves. Alternatively, `L1.single_buffer((d0, d1), fp16)`
+        gives the shape directly (each `d` a tile split or an integer expression)
+        for an L1-only buffer with no L2 tensor behind it. Emits `mg.alloc` and
+        binds `name` to a `Buf` with `depth` slots (1 for `single_buffer`, >= 2
+        for `multi_buffer`).
         """
         args = s.value.args
-        view = self.ev(args[0]) if args else None
-        if not isinstance(view, ir.View):
-            raise MgcError(s, f'L1.{kind}() takes an L2 tensor view that fixes its shape')
+        if args and isinstance(args[0], ast.Tuple):
+            if len(args) != 2 or _name(args[1]) not in DTYPES:
+                raise MgcError(s, f'L1.{kind}((d0, d1, ...), dtype) needs a dtype: {", ".join(DTYPES)}')
+            sizes = []
+            for e in args[0].elts:
+                v = self.ev(e)
+                sizes.append(v.size if isinstance(v, Split) else self.expr(e))
+            view = ir.View(None, [Const(0)] * len(sizes), sizes, [True] * len(sizes))
+            dtype = _name(args[1])
+        else:
+            view = self.ev(args[0]) if args else None
+            if not isinstance(view, ir.View):
+                raise MgcError(s, f'L1.{kind}() takes an L2 tensor view or a shape tuple and a dtype')
+            dtype = self.env[view.tensor].dtype
         depth = 1
         for kw in s.value.keywords:
             if kw.arg == 'depth' and kind == 'multi_buffer':
@@ -747,7 +820,7 @@ class Frontend:
         if not view.shape:
             raise MgcError(s, 'cannot allocate a scalar')
         op = self.add(ir.AllocOp.create(attributes={'sym': StringAttr(name), 'view': ir.ViewAttr(view),
-                                                    'depth': IntAttr(depth)},
+                                                    'dtype': StringAttr(dtype), 'depth': IntAttr(depth)},
                                         result_types=[ir.BufType()]), s)
         op.res.name_hint = name
         self.env[name] = Buf(name, op.res, view, depth)
@@ -763,13 +836,17 @@ class Frontend:
         if isinstance(v, Slot) and isinstance(v.buf, Buf):
             return v.buf, v.index
         if isinstance(v, (Remote, Slot)):
-            raise MgcError(n, 'neighbour buffers (`.on()`) can only be the destination of dma.store')
+            raise MgcError(n, 'buffers on other tiles (`.at_rel()`, `.at()`, `.row`, `.col`) can only be '
+                           'the destination of idma.store')
+        if isinstance(v, LocalView):
+            raise MgcError(n, 'a block of a local buffer (`b[i, :]`) can only be the source of a store into '
+                           'a block of another buffer (`idma.store(c.at(y, x)[j, :], b[i, :])`)')
         raise MgcError(n, 'expected an L1 buffer or multi-buffer slot')
 
     def action(self, c, s):
         """Translate a call statement; returns an event reference (or None).
 
-        Handled calls: `e.wait()` / `dma.load(...).wait()`, `dma.load/store`,
+        Handled calls: `e.wait()` / `idma.load(...).wait()`, `idma.load/store`,
         accelerator calls (`redmule.gemm`, `.enqueue`, `.commit`, ...), kernel
         calls, `check(a, b, tol=...)`, `sync(SCOPE)`, `rotate(var)`.
         The returned event lets callers chain `.wait()` or store it in a name.
@@ -778,14 +855,22 @@ class Frontend:
         if fn is None:
             raise MgcError(c, 'expected a call')
         on = _name(obj)
-        if fn == 'wait' and obj is not None and on not in ('dma',) and on not in devices.HWPES:
+        if fn == 'wait' and obj is not None and on not in ('idma',) and on not in devices.HWPES:
             ev = self.action(obj, s) if isinstance(obj, ast.Call) else self.ev(obj)
             if not isinstance(ev, ir.EvtRef):
                 raise MgcError(c, '.wait() applies to events of DMA transfers and accelerator jobs')
-            self.add(ir.WaitOp.create(attributes={'event': ir.EvtAttr(ev)}), s)
+            attrs = {'event': ir.EvtAttr(ev)}
+            lag = self._lag(c)
+            if lag is not None:
+                if ev.kind == 'idma':
+                    raise MgcError(c, '`lag=` applies to accelerator jobs: DMA waits are placed by pipeline()')
+                attrs['lag'] = IntAttr(lag)
+            self.add(ir.WaitOp.create(attributes=attrs), s)
             return None
-        if on == 'dma' and fn in ('load', 'store'):
-            return self.dma(c, fn, s)
+        if on == 'dma':
+            raise MgcError(c, '`dma` was renamed `idma`: use `idma.load` / `idma.store`')
+        if on == 'idma' and fn in ('load', 'store'):
+            return self.idma(c, fn, s)
         if on in devices.HWPES:
             return self.hwpe(c, on, fn, s)
         k = self.env.get(fn) if on is None else None
@@ -807,19 +892,26 @@ class Frontend:
             return None
         raise MgcError(c, f'unknown operation `{ast.unparse(c.func)}`')
 
-    def dma(self, c, fn, s):
-        """`dma.load(dst_slot, l2_view)` / `dma.store(dst, src_slot)`.
+    def idma(self, c, fn, s):
+        """`idma.load(dst_slot, l2_view)` / `idma.store(dst, src_slot)`.
 
-        - `dma.load(x[0], X[0:8, :])`: L2 -> L1;
-        - `dma.store(Y[0:8, :], y[0])`: L1 -> L2;
-        - `dma.store(y.on(1, 0)[0], y[0])`: L1 -> same slot of the same buffer
-          on the tile below (neighbour store).
+        - `idma.load(x[0], X[0:8, :])`: L2 -> L1;
+        - `idma.store(Y[0:8, :], y[0])`: L1 -> L2;
+        - `idma.store(y.at_rel(1, 0)[0], y[0])`: L1 -> same slot of the same buffer
+          on the tile below (neighbour store);
+        - `idma.store(y.at(r, c)[0], y[0])`: same, on tile `(r, c)` (absolute ids);
+        - `idma.store(y.row[0], y[0])` / `y.col[0]`: same, on every other tile of
+          this tile's row / column (multicast);
+        - `idma.store(rowms.at(y_id, 0)[x_id, :], rowm)`: L1 -> row `x_id` of another
+          (single-slot) buffer on tile `(y_id, 0)`; works with every remote target.
+        - `idma.store(rowms.at(y_id, 0)[x_id, :], rowms[0, :])`: same, reading a
+          contiguous block of a local (single-slot) buffer.
 
-        Emits `mg.dma` and returns the DMA event of that buffer/direction, to
-        be waited with `.wait()`. Geometry is checked later by `legalize-dma`.
+        Emits `mg.idma` and returns the DMA event of that buffer/direction, to
+        be waited with `.wait()`. Geometry is checked later by `legalize-idma`.
         """
         if len(c.args) != 2 or c.keywords:
-            raise MgcError(c, f'dma.{fn}(dst, src)')
+            raise MgcError(c, f'idma.{fn}(dst, src)')
         dst, src = c.args
         attrs = {}
         operands = []
@@ -827,34 +919,53 @@ class Frontend:
             buf, idx = self.operand(dst)
             view = self.ev(src)
             if not isinstance(view, ir.View):
-                raise MgcError(src, 'the source of dma.load must be an L2 tensor view '
+                raise MgcError(src, 'the source of idma.load must be an L2 tensor view '
                                '(L1->L1 copies are not supported)')
             attrs['l2'] = ir.ViewAttr(view)
             d = 0
         else:
-            buf, idx = self.operand(src)
+            sv = self.ev(src) if isinstance(src, ast.Subscript) else None
+            if isinstance(sv, LocalView):
+                buf, idx = sv.buf, Const(0)
+                attrs['src'] = ir.ViewAttr(sv.view)
+            else:
+                buf, idx = self.operand(src)
             tv = self.ev(dst)
             d = 1
+            if 'src' in attrs and not isinstance(tv, RemoteView):
+                raise MgcError(c, 'a block of a local buffer (`b[i, :]`) can only be stored into a block of '
+                               'another buffer (`c.at(y, x)[j, :]`)')
             if isinstance(tv, ir.View):
                 attrs['l2'] = ir.ViewAttr(tv)
-            elif isinstance(tv, Slot) and isinstance(tv.buf, Remote) or isinstance(tv, Remote):
-                r = tv.buf if isinstance(tv, Slot) else tv
-                ridx = tv.index if isinstance(tv, Slot) else Const(0)
-                if r.buf is not buf:
-                    raise MgcError(c, 'a neighbour store copies a buffer into the same buffer on the neighbour tile')
-                if ridx.c() != idx.c():
-                    raise MgcError(c, 'a neighbour store must target the same slot it reads')
-                rop = self.add(ir.RemoteOp.create(operands=[buf.value],
-                                                  attributes={'dy': ir.E(r.dy), 'dx': ir.E(r.dx)},
+            elif isinstance(tv, (Remote, RemoteView)) or isinstance(tv, Slot) and isinstance(tv.buf, Remote):
+                if isinstance(tv, RemoteView):
+                    # L1 -> a block of another (single-slot) buffer on other tile(s)
+                    r = tv.remote
+                    rattrs = {'mode': StringAttr(r.mode), 'view': ir.ViewAttr(tv.view)}
+                else:
+                    r = tv.buf if isinstance(tv, Slot) else tv
+                    ridx = tv.index if isinstance(tv, Slot) else Const(0)
+                    if r.buf is not buf:
+                        raise MgcError(c, 'a remote store copies a buffer into the same buffer on another '
+                                       'tile, or into a block of another one (`b.at(y, x)[i, :]`)')
+                    if ridx.c() != idx.c():
+                        raise MgcError(c, 'a remote store must target the same slot it reads')
+                    rattrs = {'mode': StringAttr(r.mode)}
+                if r.mode == 'rel':
+                    rattrs.update({'dy': ir.E(r.a), 'dx': ir.E(r.b)})
+                elif r.mode == 'abs':
+                    rattrs.update({'ty': ir.E(r.a), 'tx': ir.E(r.b)})
+                rop = self.add(ir.RemoteOp.create(operands=[r.buf.value], attributes=rattrs,
                                                   result_types=[ir.BufType()]), s)
                 operands.append(rop.res)
             else:
-                raise MgcError(dst, 'the destination of dma.store must be an L2 tensor view or a '
-                               'neighbour buffer slot (`buf.on(dy, dx)[i]`)')
-        ev = ir.EvtRef('dma', buf.name, dir=d)
+                raise MgcError(dst, 'the destination of idma.store must be an L2 tensor view or a '
+                               'buffer slot on other tile(s) (`buf.at_rel(dy, dx)[i]`, `buf.at(y, x)[i]`, '
+                               '`buf.row[i]`, `buf.col[i]`)')
+        ev = ir.EvtRef('idma', buf.name, dir=d)
         attrs.update({'dir': IntAttr(d), 'slot': ir.E(idx), 'event': ir.EvtAttr(ev)})
-        self.add(ir.DmaOp.create(operands=[buf.value] + operands, attributes=attrs), s)
-        return ir.EvtRef('dma', buf.name, dir=d)
+        self.add(ir.IdmaOp.create(operands=[buf.value] + operands, attributes=attrs), s)
+        return ir.EvtRef('idma', buf.name, dir=d)
 
     def _job_operands(self, c, s):
         """Split the positional args of a job call into parallel lists:
@@ -881,21 +992,46 @@ class Frontend:
             raise MgcError(c, f'unknown arguments: {", ".join(kw)}')
         return ev or ir.EvtRef('hwpe', acc)
 
+    def _lag(self, c):
+        """The `lag=k` argument of a protocol step (`redmule.commit_start(lag=1)`,
+        `ev[i].wait(lag=0)`), or None; only valid inside `pipeline()`."""
+        kw = {k.arg: k.value for k in c.keywords}
+        if set(kw) - {'lag'} or c.args:
+            raise MgcError(c, f'{ast.unparse(c.func)}() takes only `lag=`')
+        if 'lag' not in kw:
+            return None
+        if not self.in_pipeline:
+            raise MgcError(c, '`lag=` is only meaningful inside pipeline()')
+        try:
+            lag = ast.literal_eval(kw['lag'])
+        except ValueError:
+            lag = None
+        if not isinstance(lag, int) or lag < 0:
+            raise MgcError(c, '`lag=` must be a non-negative integer constant')
+        return lag
+
     def hwpe(self, c, acc, fn, s):
         """Accelerator calls on `acc` (e.g. `redmule`):
 
         - `redmule.gemm(x, w, y)` (a job named in `devices.HWPES`): one-shot job,
           computes `y += x @ w`; returns its event;
         - `redmule.enqueue(x, w, y, event=ev[k])`: program a job without starting it;
-        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control.
+        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control
+          (inside `pipeline()`, with an optional `lag=k`).
         """
         dev = devices.HWPES[acc]
         if fn in ('commit', 'start', 'commit_start'):
             job = next(iter(dev.jobs))
-            self.add(ir.HwpeOp.create(attributes={'acc': StringAttr(acc), 'job': StringAttr(job),
-                                                  'action': StringAttr(fn), 'slots': ArrayAttr([])}), s)
+            attrs = {'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr(fn),
+                     'slots': ArrayAttr([])}
+            lag = self._lag(c)
+            if lag is not None:
+                attrs['lag'] = IntAttr(lag)
+            self.add(ir.HwpeOp.create(attributes=attrs), s)
             return None
         if fn == 'enqueue':
+            if any(k.arg == 'lag' for k in c.keywords):
+                raise MgcError(c, '`lag=` is not accepted on enqueue: pipeline() issues it with its commit')
             job = next(iter(dev.jobs))
             ev = self._event_kw(c, acc)
             bufs, slots = self._job_operands(c, s)
@@ -999,7 +1135,11 @@ class Frontend:
             def enter():
                 self.env[var] = Sym(var, None, 'int')
 
-            op = ir.PipelineOp.create(attributes=attrs, regions=[self.region(s.body, enter=enter)])
+            self.in_pipeline = True
+            try:
+                op = ir.PipelineOp.create(attributes=attrs, regions=[self.region(s.body, enter=enter)])
+            finally:
+                self.in_pipeline = False
         self.add(op, s)
         if saved is None:
             self.env.pop(var, None)

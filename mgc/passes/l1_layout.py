@@ -6,13 +6,15 @@
 """l1-layout: one L1 layout, identical on every tile.
 
 Buffers and their slots are bump-allocated from `l1_tile_base` in declaration
-order. When a buffer is accessed on a neighbour tile (`buf.on(dy, dx)`), the
-neighbour's copy must be at the same offset, so slot sizes use the *maximum*
-tile sizes (`tile_h_max`): with actual sizes a clipped edge tile would lay its
-buffers out differently and receive data at the wrong address.
+order. When a buffer is accessed on another tile (`buf.at_rel(dy, dx)`,
+`buf.at(y, x)`, `buf.row`, `buf.col`), the other tile's copy must be at the
+same offset, so slot sizes use the *maximum* tile sizes (`tile_h_max`): with
+actual sizes a clipped edge tile would lay its buffers out differently and
+receive data at the wrong address.
 
-`buf.on(dy, dx)` resolves to the neighbour's L1 base plus the local offset;
+`buf.at_rel(dy, dx)` resolves to the neighbour's L1 base plus the local offset;
 the base is computed once per direction (`l1_base_s` = tile below, ...).
+Absolute and multicast targets compute the base where they are used.
 """
 
 from __future__ import annotations
@@ -59,6 +61,8 @@ class L1Layout(ModulePass):
                 prev = (slot, nbytes)
             a.attributes['addrs'] = ir.exprs(addrs)
         for r in remotes:
+            if r.mode.data != 'rel':
+                continue
             dy, dx = r.dy.data.value(), r.dx.data.value()
             if dy is None or dx is None:
                 raise MgcError(r, 'neighbour offsets must be compile-time constants')

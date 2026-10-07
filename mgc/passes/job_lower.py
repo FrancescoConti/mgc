@@ -6,8 +6,8 @@
 """job-lower: jobs -> executor-specific operations.
 
 * `mg.job` on an HWPE ("redmule.gemm")  -> `mg.hwpe` oneshot (enqueue+commit+start).
-  (Pipelined jobs were already split into enqueue / commit / start by the
-  pipeline pass, which owns that scheduling decision.)
+  (Jobs written as `enqueue` / `commit_start` / `wait` are already `mg.hwpe`
+  steps, placed by the pipeline pass inside `pipeline()`.)
 * `mg.job` on a software L1 kernel        -> `mg.call` (synchronous, CV32 core).
 
 For every job (and HWPE enqueue) the scalar parameters are derived from the

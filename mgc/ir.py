@@ -42,8 +42,9 @@ from .expr import Expr
 
 @dataclass(eq=False)
 class View:
-    """A view of an L2 tensor: per-dimension start/size; `kept` is False for an integer index."""
-    tensor: str  # mg.tensor symbol
+    """A view of an L2 tensor: per-dimension start/size; `kept` is False for an integer index.
+    `tensor` is None for the shape of an L1-only buffer (`L1.single_buffer((d0, d1), fp16)`)."""
+    tensor: Optional[str]  # mg.tensor symbol, None = L1-only
     starts: List[Expr]
     sizes: List[Expr]
     kept: List[bool]
@@ -56,7 +57,7 @@ class View:
         parts = []
         for st, sz, k in zip(self.starts, self.sizes, self.kept):
             parts.append(f'{st.c()}:+{sz.c()}' if k else st.c())
-        return f'{self.tensor}[{", ".join(parts)}]'
+        return f'{self.tensor or "L1"}[{", ".join(parts)}]'
 
 
 @dataclass(eq=False)
@@ -80,9 +81,9 @@ class Xfer:
 class EvtRef:
     """Event storage: a DMA event (per buffer and direction), an accelerator's
     default event, or an element of an event array."""
-    kind: str  # 'dma' | 'hwpe' | 'array'
+    kind: str  # 'idma' | 'hwpe' | 'array'
     name: str  # buffer name | accelerator | array name
-    dir: Optional[int] = None  # dma only
+    dir: Optional[int] = None  # idma only
     index: Optional[Expr] = None  # array only
     cname: Optional[str] = None  # resolved C pointer expression (event-alloc / multi-buffer)
 
@@ -286,10 +287,12 @@ class ScalarOp(IRDLOperation):
 @irdl_op_definition
 class AllocOp(IRDLOperation):
     """L1 buffer with `depth` slots, shaped like `view` (which also fixes its
-    transfer geometry). legalize-dma adds `xfer`, l1-layout adds `addrs`."""
+    transfer geometry; an L1-only buffer has a tensorless view and no L2 address).
+    legalize-idma adds `xfer` (and `axi`), l1-layout adds `addrs`."""
     name = 'mg.alloc'
     sym = attr_def(StringAttr)
     view = attr_def(ViewAttr)
+    dtype = attr_def(StringAttr)
     depth = attr_def(IntAttr)
     xfer = opt_attr_def(XferAttr)
     axi = opt_attr_def(ExprAttr)
@@ -299,12 +302,20 @@ class AllocOp(IRDLOperation):
 
 @irdl_op_definition
 class RemoteOp(IRDLOperation):
-    """The same allocation on the tile at (y_id + dy, x_id + dx)."""
+    """An allocation on other tile(s), by `mode`:
+    `rel`: the tile at (y_id + dy, x_id + dx), constant offsets;
+    `abs`: the tile at (ty, tx), any integer expressions;
+    `row` / `col`: every other tile of this tile's row / column (multicast).
+    With `view`, only that block of the (single-slot) allocation."""
     name = 'mg.remote'
     buf = operand_def(BufType)
-    dy = attr_def(ExprAttr)
-    dx = attr_def(ExprAttr)
-    base = opt_attr_def(StringAttr)  # neighbour L1 base variable (l1-layout)
+    mode = attr_def(StringAttr)  # 'rel' | 'abs' | 'row' | 'col'
+    view = opt_attr_def(ViewAttr)  # tensorless view over the buffer's shape
+    dy = opt_attr_def(ExprAttr)  # rel
+    dx = opt_attr_def(ExprAttr)  # rel
+    ty = opt_attr_def(ExprAttr)  # abs
+    tx = opt_attr_def(ExprAttr)  # abs
+    base = opt_attr_def(StringAttr)  # neighbour L1 base variable (l1-layout, rel only)
     res = result_def(BufType)
 
 
@@ -357,18 +368,22 @@ class PipelineOp(_Region):
 
 
 @irdl_op_definition
-class DmaOp(IRDLOperation):
-    """iDMA transfer between a local L1 slot and either an L2 view or the same
-    slot on a neighbour tile (`remote`). dir 0: into L1, 1: out of L1."""
-    name = 'mg.dma'
+class IdmaOp(IRDLOperation):
+    """iDMA transfer between a local L1 slot and either an L2 view, the same
+    slot on other tile(s) or a block of another buffer there (`remote`, see
+    `mg.remote`). dir 0: into L1, 1: out of L1. A store into a block may read a
+    contiguous block of the local buffer (`src`)."""
+    name = 'mg.idma'
     local = operand_def(BufType)
     remote = opt_operand_def(BufType)
     dir = attr_def(IntAttr)
     slot = attr_def(ExprAttr)
     l2 = opt_attr_def(ViewAttr)
+    src = opt_attr_def(ViewAttr)  # store from a block of the local buffer (`b[i, :]`)
     event = attr_def(EvtAttr)
-    xfer = opt_attr_def(XferAttr)  # legalize-dma
-    axi = opt_attr_def(ExprAttr)  # legalize-dma: L2-side address
+    xfer = opt_attr_def(XferAttr)  # legalize-idma
+    axi = opt_attr_def(ExprAttr)  # legalize-idma: L2-side address
+    obi = opt_attr_def(ExprAttr)  # legalize-idma: byte offset of the `src` block in the local buffer
     addr = opt_attr_def(StringAttr)  # multi-buffer: local slot address
 
 
@@ -398,6 +413,7 @@ class HwpeOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)
     addrs = opt_attr_def(ArrayAttr)
+    lag = opt_attr_def(IntAttr)  # pipeline(): extra stages after the earliest legal one
 
 
 @irdl_op_definition
@@ -416,6 +432,7 @@ class WaitOp(IRDLOperation):
     """Block until the DMA transfer / accelerator job tied to `event` is done."""
     name = 'mg.wait'
     event = attr_def(EvtAttr)
+    lag = opt_attr_def(IntAttr)  # pipeline(): stages after the job's start (default 1)
 
 
 @irdl_op_definition
@@ -445,6 +462,6 @@ class CheckOp(IRDLOperation):
 
 MG = Dialect('mg', [
     TensorOp, DefineOp, KernelOp, FuncOp, TilesOp, CommentOp, SplitOp, ScalarOp, AllocOp, RemoteOp,
-    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, DmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
+    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, IdmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
     SelectOp, CheckOp
 ], [ExprAttr, ViewAttr, XferAttr, EvtAttr, SelectAttr, BufType])

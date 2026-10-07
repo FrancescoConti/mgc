@@ -87,7 +87,7 @@ class MultiBuffer(ModulePass):
             return ptr_name(kind, name, off)
 
         for op in list(module.walk()):
-            if isinstance(op, ir.DmaOp):
+            if isinstance(op, ir.IdmaOp):
                 a = alloc_of(op.local)
                 op.attributes['addr'] = StringAttr(resolve(op, 'buf', a.sym.data, a.depth.data, op.slot.data))
             elif isinstance(op, (ir.HwpeOp, ir.CallOp, ir.JobOp)) and len(op.bufs):

@@ -44,7 +44,7 @@ or the compiler; the unit tests fail if they are out of date.
 
 | Directory | Source | Content |
 |---|---|---|
-| `tests/magia/mesh/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline |
+| `tests/magia/mesh/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
 | `tests/magia/mesh/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
 | `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
 | `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
@@ -64,21 +64,23 @@ for y_id, x_id in tiles():
     t_start: u8 = y_id * 2
     total_timeslots: u8 = (MESH_Y_TILES - 1) * 2 + timeslots + 1
 
-    w = L1.alloc(W[tile_h, tile_w])
+    w = L1.single_buffer(W[tile_h, tile_w])
     x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
     y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
 
     for z in range(N_ITERATIONS):
-        dma.load(w, W[tile_h, tile_w]).wait()
+        idma.load(w, W[tile_h, tile_w]).wait()
         for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=GLOBAL):
             if y_id == 0:
-                dma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
-            dma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
-            redmule.gemm(x[pt], w, y[pt])                 # y += x @ w
+                idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
+            idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
+            j = redmule.enqueue(x[pt], w, y[pt])          # y += x @ w
+            redmule.commit_start()
+            j.wait(lag=0)                                 # done within the step
             if y_id == MESH_Y_TILES - 1:
-                dma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
+                idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
             else:
-                dma.store(y.on(1, 0)[pt], y[pt])          # same slot, tile below
+                idma.store(y.at_rel(1, 0)[pt], y[pt])          # same slot, tile below
 
     sync(COL)
     if y_id == MESH_Y_TILES - 1:
@@ -132,22 +134,36 @@ tile split, or an integer expression (which removes the dimension).
 
 | Expression | Meaning |
 |---|---|
-| `b = L1.alloc(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
+| `b = L1.single_buffer(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
+| `b = L1.single_buffer((d0, d1, ...), dtype)` | L1-only buffer: each `d` is a tile split (its per-tile size) or an integer expression, e.g. `L1.single_buffer((tile_h, tile_w), fp16)`. No L2 tensor is involved; transfers to/from L2 must be dense. `L1.multi_buffer((d0, ...), dtype, depth=N)` works the same way |
 | `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset with \|k\| < N, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. |
-| `b.on(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.on(0, 1)` is the tile to the right, `b.on(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `dma.store`, to push a local buffer to a neighbour: `dma.store(b.on(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
+| `b.at_rel(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.at_rel(0, 1)` is the tile to the right, `b.at_rel(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `idma.store`, to push a local buffer to a neighbour: `idma.store(b.at_rel(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
+| `b.at(y, x)[k]` | As `b.at_rel`, but on the tile with **absolute** coordinates `(y, x)`, which can be any integer expressions, including run-time ones (e.g. `b.at(y_id, 0)`, the first tile of this row). The tile's L1 base is computed where the transfer is issued (`get_l1_base(GET_ID(y, x))`). |
+| `b.at(y, x)[i, j, ...]` | A **block** of single-slot buffer `b` on another tile (works with `at_rel`, `at`, `row`, `col`). Indices are as for L2 views (slices, or integers that drop the dimension), over `b`'s shape; there must be more than one index or a slice, otherwise it is a slot. Only the destination of `idma.store`, whose source can then be **any** local buffer or slot of the same shape and dtype: `idma.store(rs.at(y_id, 0)[x_id, :], r)` gathers `r` into row `x_id` of `rs` on the first tile of the row. The block's offset is computed with this tile's sizes, so tile splits in `b`'s shape must be the same on the receiving tile (e.g. a split along the axis shared by the two tiles). |
+| `b[i, j, ...]` | A **block** of local single-slot buffer `b`, with indices as for `b.at(y, x)[i, j, ...]` (more than one index or a slice). Only the source of a store into a block of another buffer, and it must be contiguous: `idma.store(rs.at(y_id, 0)[x_id, :], rs[0, :])` sends row 0 of the local `rs` to row `x_id` of `rs` on the first tile of the row. |
+| `b.row[k]`, `b.col[k]` | **Multicast**: the copies of `b` on every *other* tile of this tile's row (`row`) or column (`col`). Same rules as `b.at_rel`: `idma.store(b.row[k], b[k])` copies local slot `k` into slot `k` of `b` on all the other tiles of the row. |
 
 ### Transfers and events
 
 | Statement | Meaning |
 |---|---|
-| `e = dma.load(slot, view)` | asynchronous L2 → L1 |
-| `e = dma.store(view, slot)` | asynchronous L1 → L2 |
-| `e = dma.store(b.on(dy, dx)[k], b[k])` | asynchronous L1 → neighbour's L1, same slot |
+| `e = idma.load(slot, view)` | asynchronous L2 → L1 |
+| `e = idma.store(view, slot)` | asynchronous L1 → L2 |
+| `e = idma.store(b.at_rel(dy, dx)[k], b[k])` | asynchronous L1 → neighbour's L1, same slot |
+| `e = idma.store(b.at(y, x)[k], b[k])` | asynchronous L1 → L1 of tile `(y, x)`, same slot |
+| `e = idma.store(b.row[k], b[k])`, `b.col[k]` | asynchronous L1 → L1 of every other tile of the row / column, same slot |
+| `e = idma.store(c.at(y, x)[i, :], b[k])` | asynchronous L1 → a block of buffer `c` on tile `(y, x)`; also `at_rel`, `row`, `col`. The block may be 2-D strided (`c.at(y, x)[:, 4:8]`) |
+| `e = idma.store(c.at(y, x)[i, :], b[j, :])` | as above, from a contiguous block of local buffer `b` |
 | `e.wait()` | wait for the transfer |
 
 Allowed transfers follow `devices.IDMA`. After merging contiguous dimensions, a transfer is at
 most `max_rank`-dimensional (currently 2: `mg_idma_memcpy_1d/2d`), with unit steps and a dense
 L1 side. L1→L1 within a tile and L2→L2 are rejected.
+
+Row/column multicasts are lowered by `idma-mcast` to one unicast per destination tile (a `for` over
+`MESH_X_TILES`/`MESH_Y_TILES` that skips the issuing tile), all on the same event: same-direction
+iDMA transfers complete in issue order, so one `e.wait()` waits for all of them. Once the iDMA
+supports multicast in hardware, an `IDMA.multicast` entry makes it a single call.
 
 Each L1 buffer has one event per direction (`idma_evt_<buf>_in/_out`). The two are merged into
 `idma_evt_<buf>` when they are never pending at the same time. The following are compile errors:
@@ -163,6 +179,7 @@ waiting on an event that was never issued.
 | `redmule.enqueue(x, w, y, event=ev[k])` | `mg_redmule_gemm_enqueue` |
 | `redmule.commit()`, `start()`, `commit_start()` | `mg_redmule_gemm_commit`, `_start`, `_commit_start` |
 | `ev[k].wait()` | `mg_redmule_wait` |
+| `commit…(lag=k)`, `.wait(lag=k)` | inside `pipeline()` only: place the step `k` stages later (see below) |
 | `k(a, b, ...)` (an `l1_kernel`) | `c_fn(a, b, ..., params)`, a synchronous call on the CV32 core |
 | `sync(GLOBAL)`, `sync(ROW)`, `sync(COL)` | `fsync_sync_global/row/col` + `eu_fsync_wait` |
 | `rotate(v)` | places the multi-buffer slot selection for `v` here (optional) |
@@ -179,31 +196,57 @@ operand addresses, then the parameters, all as `uint32_t`, and must be provided 
 
 ### `pipeline(n, skew=None, steps=None, sync=None)`
 
-The body describes one iteration `i`: transfers and jobs, optionally inside `if` statements that
-do not depend on `i`. The compiler:
+The body describes one iteration `i`: transfers, jobs, CV32 kernel calls and HWPE protocol steps,
+with transfers and jobs optionally inside `if` statements that do not depend on `i`. The compiler:
 
 1. **Assigns stages.** An item is placed one stage after the latest earlier item that writes a
-   slot it reads; otherwise it is in stage 0. Examples: load (0) → gemm (1) → store (2).
-2. **Checks multi-buffer depth.** Each multi-buffer must have at least as many slots as the
-   number of stages its slots are live across.
+   slot it reads; otherwise it is in stage 0. Examples: load (0) → kernel (1) → store (2).
+   HWPE protocol steps follow their own rules (below).
+2. **Checks depths.** Each multi-buffer must have at least as many slots as the number of stages
+   its slots are live across. Each HWPE can hold `queue_depth` jobs (2 for RedMulE), and each job
+   in flight needs its own event.
 3. **Generates the schedule.** A prologue runs stage 0 of iteration 0. In loop step `s`,
-   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. Within a step, the
-   issue order is: transfers, then accelerator jobs, then CV32 calls; the waits follow, in issue
-   order.
+   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. A step runs in four
+   phases:
+   1. transfers, enqueues and `redmule.gemm` one-shots are issued;
+   2. commits/starts follow, each after the waits of the DMAs it needs, so the HWPE computes
+      while the core is busy with the next phase;
+   3. CV32 kernel calls, each followed by the commits that consume its output;
+   4. the remaining waits, in issue order.
 
 With `skew` and `steps`, the loop runs over `steps` global time steps. The tile is active when
 `0 <= t - skew <= last step`. `sync=SCOPE` adds a barrier after the prologue and at the end of
 every time step, active or not.
 
-RedMulE uses early enqueue (program the next job during the DMA, commit it behind the current
-one) only when all of these hold:
+#### HWPE jobs
 
-- the pipeline has 2 stages and no skew;
-- it contains exactly one job;
-- none of the job's operands is written by another tile.
+A job is written as the steps of the HWPE protocol:
 
-Otherwise each job is issued and waited within its step. Data from a neighbour is only valid
-after the barrier, so the job cannot be committed earlier.
+```python
+ev = redmule.events(2)
+for i in pipeline(timeslots):
+    idma.load(x[i], X[...])
+    idma.load(w[i], W[...])
+    redmule.enqueue(x[i], w[i], y, event=ev[i])   # program the job: addresses only
+    redmule.commit_start()                         # or commit() and start()
+    ev[i].wait()
+```
+
+| Step | Stage |
+|---|---|
+| `commit_start()` / `commit()` | the stage of its latest producer, placed after it in the step (after the DMA's wait, or after the CV32 call); one stage later if the producer is an asynchronous job, or if the operand is written by another tile (data from a neighbour is valid only after the barrier) |
+| `enqueue(...)` | same stage as its commit, issued together with the transfers so that programming overlaps the DMA |
+| `start()` | commit + `lag` |
+| `.wait()` | start (or `commit_start`) + `lag`, **default `lag=1`**: job `i` runs while iteration `i + 1` loads; the wait is the writer of the job's outputs for later items |
+
+`lag=k` on `commit`/`commit_start`/`start`/`.wait()` moves the step `k` stages later. In the
+example, the step of iteration `i + 1` loads, enqueues and commits job `i + 1` behind job `i`,
+then waits for job `i`. `.wait(lag=0)` keeps the job inside its step, as the systolic WS/IS
+tests do. With load → job → store, the store follows the wait one stage later, so `y` needs
+depth 3. The compiler checks that each protocol is complete and in order. It also checks that
+there is at most one explicit job per accelerator per `pipeline()` body and that the job does
+not exceed the queue or the event array. `event=` may be omitted when only one job is in flight.
+`redmule.gemm(...)` remains available as a one-shot job, issued and waited within its step.
 
 The control-flow shape of the generated C follows the hand-written tests, because GCC's output
 depends on it:
@@ -224,7 +267,7 @@ pipelines. A fixed sequence of passes then lowers that intent to low-level detai
 and the last stage prints C against mglib. Each pass can be inspected on its own with `--print-ir-after`.
 
 ```
-.mgc → frontend → legalize-dma → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → emit-c → clang-format
+.mgc → frontend → legalize-idma → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → idma-mcast → emit-c → clang-format
 ```
 
 `mgc` also assists the MAGIA programmer by taking some decisions autonomously and rejecting some
@@ -253,14 +296,14 @@ def main():
     for y_id, x_id in tiles():
         tile_h = y_id.split(M)                    # rows owned by this tile
         tile_w = x_id.split(K)                    # columns owned by this tile
-        x = L1.alloc(X[tile_h, :])
-        w = L1.alloc(W[:, tile_w])
-        y = L1.alloc(Y[tile_h, tile_w])
-        dma.load(x, X[tile_h, :])
-        dma.load(w, W[:, tile_w])
-        dma.load(y, Y[tile_h, tile_w]).wait()
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
+        idma.load(x, X[tile_h, :])
+        idma.load(w, W[:, tile_w])
+        idma.load(y, Y[tile_h, tile_w]).wait()
         redmule.gemm(x, w, y)
-        dma.store(Y[tile_h, tile_w], y).wait()
+        idma.store(Y[tile_h, tile_w], y).wait()
 ```
 
 The 14 source lines become about 130 lines of C (excerpt):
@@ -279,7 +322,7 @@ mg_redmule_gemm(&redmule_ctrl, &eu_ctrl, WAIT_MODE, l1_addr_x, l1_addr_w, l1_add
                 (uint16_t)tile_h, (uint16_t)N_SIZE, (uint16_t)tile_w, &redmule_evt, NULL);
 ```
 
-The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-dma` turns it into a 2-D
+The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-idma` turns it into a 2-D
 transfer, while `X[tile_h, :]` is contiguous and stays 1-D. The GEMM dimensions come from the
 buffer shapes, and the `tile_h`/`tile_w` borders handle meshes that do not divide the problem.
 To see the intermediate steps, run `mgcc.py tiny.mgc --print-ir-after=frontend` (or any pass name).
@@ -310,12 +353,13 @@ IR conventions:
 
 | Pass | Job |
 |---|---|
-| `legalize-dma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
-| `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, depth check, job protocol |
+| `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
+| `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, HWPE protocol placement, depth/queue checks |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
 | `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
 | `event-alloc` | event variable names; dataflow check of issue/wait |
+| `idma-mcast` | row/column multicasts → loops of unicast transfers, unless `devices.IDMA.multicast` lists the scope |
 | `emit-c` | prints C; each buffer's `len_/std_/reps_/l1_addr_/l2_addr_` is declared once and referenced by name |
 
 Extending:
@@ -323,6 +367,7 @@ Extending:
 | To add | Change |
 |---|---|
 | an iDMA mode (3-D, ...) | `IDMA.max_rank` and `IDMA.functions` in `devices.py` |
+| hardware row/column multicast | `IDMA.multicast` in `devices.py` (scope → mglib function) |
 | an HWPE accelerator | an `Hwpe` entry in `devices.py` (operands, parameters, constraints, queue depth, function names) and its mglib wrapper |
 | a software kernel | `l1_kernel(...)` in the `.mgc` file and the C function |
 | Spatz / PULP offload | an asynchronous executor (needs an mglib layer first) |
@@ -331,22 +376,29 @@ Extending:
 
 2×2 mesh, gvsoc. Exit cycle of each tile, sorted. Every test reports 0 errors.
 
+> The `mm_os_mgc`, `mm_ws_mgc` (`mm_ws.mgc`), `mm_is_mgc` and `mm_os_l1k` rows are measured with
+> the explicit HWPE protocol in `pipeline()` (2026-10-06). On the same gvsoc build, the code
+> generated by the earlier early-enqueue template gives 355888 / 355903 / 391194 / 391209 (OS),
+> 247466 / 247500 / 528967 / 594869 (WS), 245423 / 245431 / 583806 / 583814 (IS) and
+> 466622 / 466635 / 506299 / 506303 (L1 kernel). The WS/IS rows are therefore not comparable with
+> the reference rows, which were measured on an earlier setup and have not been re-run.
+
 | Test | Cycles |
 |---|---|
 | `mm_os_mglib` (reference) | 355929 / 355970 / 391240 / 391241 |
-| `mm_os_mgc` | 355950 / 355956 / 391247 / 391255 |
+| `mm_os_mgc` | 355517 / 355529 / 390745 / 390757 |
 | `mm_ws_2` (raw HAL) | 42954 / 43002 / 153104 / 177774 |
 | `mm_ws_mglib` (reference) | 45735 / 45769 / 156153 / 180870 |
-| `mm_ws_mgc` (`mm_ws.mgc`) | 45585 / 45603 / 152663 / 177604 |
+| `mm_ws_mgc` (`mm_ws.mgc`) | 247499 / 247526 / 528999 / 594873 |
 | `mm_ws_mgc` (`mm_ws_explicit.mgc`) | 45398 / 45432 / 152476 / 177424 |
 | `mm_is_2` (raw HAL) | 43292 / 43297 / 171430 / 171435 |
 | `mm_is_mglib` (reference) | 46064 / 46064 / 174466 / 174466 |
-| `mm_is_mgc` | 44645 / 44668 / 172983 / 173007 |
-| `mm_os_l1k` | 466772 / 466787 / 506252 / 506261 |
+| `mm_is_mgc` | 245316 / 245317 / 583684 / 583685 |
+| `mm_os_l1k` | 466796 / 466827 / 506287 / 506297 |
 
 - **OS:** `mm_os_mglib` clips `tile_w` against `N_SIZE` instead of `K_SIZE`; mgc uses `K_SIZE`.
   With that line changed back, `main` disassembles identically and the cycles are equal.
-  `mm_os.mgc` and `mm_os_explicit.mgc` produce the same C.
+  `mm_os.mgc` and `mm_os_explicit.mgc` produce the same C, comments aside.
 - **WS/IS:** the mglib references are about 3k cycles slower than the raw-HAL tests (mglib
   event bookkeeping). The mgc versions are 0.8–1.9% faster than the references on the slowest
   tile. The differences:
@@ -356,16 +408,20 @@ Extending:
   - L1 offsets use `*_max` tile sizes. `mm_ws_2` and `mm_is_2` use the local tile size, which
     gives wrong neighbour addresses when edge tiles are clipped.
 - **L1 kernel:** issuing RedMulE before the CV32 call takes 29k cycles (5.7%) less than calling
-  the kernel first.
+  the kernel first. With the explicit protocol, job `i - 1` runs on RedMulE during the CV32
+  call of iteration `i`, and job `i` is committed right after it.
 
 ## Limitations
 
 - One `tiles()` loop and one `pipeline()` per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
-- HWPE (RedMulE) early enqueue is used only in 2-stage pipelines.
+- One explicit HWPE job (enqueue / commit / wait) per accelerator per `pipeline()` body; HWPE
+  protocol steps cannot be inside `if`. DMA waits inside `pipeline()` are always placed by the
+  compiler.
 - fp16 only; RedMulE GEMM is the only HWPE accelerator described.
 - L1 kernels run only on the CV32 control core.
 - Comments inside a `pipeline()` body are dropped, except the leading docstring.
 - No L1 capacity check (tile sizes are run-time values).
 - The event check accepts code that is valid on at least one path, so it can miss errors that
   depend on correlated conditions.
-- The generated tests do not support `STALLING=1`.
+- Multicasts are lowered to unicast transfers. On a 1-wide row/column nothing is transferred, so
+  waiting on the multicast's event is invalid there.

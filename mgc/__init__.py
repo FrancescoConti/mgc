@@ -31,16 +31,16 @@ tiles = pipeline = cores = check = comment = sync = rotate = _stub
 
 
 class _Ns:
-    """Namespace stub (`L1`, `dma`, `redmule`): any attribute is a placeholder function."""
+    """Namespace stub (`L1`, `idma`, `redmule`): any attribute is a placeholder function."""
 
     def __getattr__(self, _):
         return _stub
 
 
-L1 = _Ns()  # L1.alloc(view), L1.multi_buffer(view, depth=N)
-dma = _Ns()  # dma.load(dst, src), dma.store(dst, src)
+L1 = _Ns()  # L1.single_buffer(view), L1.multi_buffer(view, depth=N)
+idma = _Ns()  # idma.load(dst, src), idma.store(dst, src)
 redmule = _Ns()  # gemm / enqueue / commit / start / commit_start / events
 
 __all__ = ['sizes', 'l2', 'define', 'test', 'top', 'l1_kernel', 'fp16', 'u8', 'u16', 'u32', 'i32', 'WFE', 'POLLING',
            'CORE', 'GLOBAL', 'ROW', 'COL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
-           'L1', 'dma', 'redmule']
+           'L1', 'idma', 'redmule']
