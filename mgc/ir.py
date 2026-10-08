@@ -18,7 +18,7 @@ Design choices (see ../README.md, "Compiler architecture"):
   and branches, which SSA cannot express without dummies. Correct use is
   checked by a dataflow analysis instead (passes/events.py).
 
-High-level ops (removed by passes): mg.pipeline, mg.job.
+High-level ops (removed by passes): mg.pipeline, mg.stage, mg.job.
 """
 
 from __future__ import annotations
@@ -288,6 +288,7 @@ class ScalarOp(IRDLOperation):
 class AllocOp(IRDLOperation):
     """L1 buffer with `depth` slots, shaped like `view` (which also fixes its
     transfer geometry; an L1-only buffer has a tensorless view and no L2 address).
+    `depth` 0: a multi-buffer whose depth the pipeline pass infers.
     legalize-idma adds `xfer` (and `axi`), l1-layout adds `addrs`."""
     name = 'mg.alloc'
     sym = attr_def(StringAttr)
@@ -321,7 +322,9 @@ class RemoteOp(IRDLOperation):
 
 @irdl_op_definition
 class EventsOp(IRDLOperation):
-    """Array of `depth` accelerator events of the given `kind` (`redmule.events(n)`)."""
+    """Array of `depth` events of the given `kind`: an accelerator (`redmule.events(n)`),
+    or 'idma' for the per-iteration DMA events of a pipeline. `depth` 0: set by
+    the pipeline pass."""
     name = 'mg.events'
     sym = attr_def(StringAttr)
     depth = attr_def(IntAttr)
@@ -356,14 +359,24 @@ class ContinueOp(IRDLOperation):
 
 @irdl_op_definition
 class PipelineOp(_Region):
-    """High level: a software-pipelined time loop (see passes/pipeline.py)."""
+    """High level: a software-pipelined time loop (see passes/pipeline.py),
+    `kind` 'pipeline' or 'systolic' (with `skew`); the body holds `mg.stage` ops."""
     name = 'mg.pipeline'
+    kind = attr_def(StringAttr)  # 'pipeline' | 'systolic'
     var = attr_def(StringAttr)
     n = attr_def(ExprAttr)
     skew = opt_attr_def(ExprAttr)
-    steps = opt_attr_def(ExprAttr)
     sync = opt_attr_def(StringAttr)
     time = opt_attr_def(StringAttr)
+    body = region_def()
+
+
+@irdl_op_definition
+class StageOp(_Region):
+    """High level: a block of a pipeline body that runs as stage `k`, i.e.
+    `k` steps after stage 0 of the same iteration."""
+    name = 'mg.stage'
+    k = attr_def(IntAttr)
     body = region_def()
 
 
@@ -413,7 +426,6 @@ class HwpeOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)
     addrs = opt_attr_def(ArrayAttr)
-    lag = opt_attr_def(IntAttr)  # pipeline(): extra stages after the earliest legal one
 
 
 @irdl_op_definition
@@ -432,7 +444,6 @@ class WaitOp(IRDLOperation):
     """Block until the DMA transfer / accelerator job tied to `event` is done."""
     name = 'mg.wait'
     event = attr_def(EvtAttr)
-    lag = opt_attr_def(IntAttr)  # pipeline(): stages after the job's start (default 1)
 
 
 @irdl_op_definition
@@ -462,6 +473,6 @@ class CheckOp(IRDLOperation):
 
 MG = Dialect('mg', [
     TensorOp, DefineOp, KernelOp, FuncOp, TilesOp, CommentOp, SplitOp, ScalarOp, AllocOp, RemoteOp,
-    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, IdmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
+    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, StageOp, IdmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
     SelectOp, CheckOp
 ], [ExprAttr, ViewAttr, XferAttr, EvtAttr, SelectAttr, BufType])

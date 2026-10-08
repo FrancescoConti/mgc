@@ -28,6 +28,7 @@ GLOBAL, ROW, COL = 'GLOBAL', 'ROW', 'COL'  # sync() / pipeline(sync=...) scopes
 
 # loop levels: spatial (tiles), time (range / pipeline), reserved (cores)
 tiles = pipeline = cores = check = comment = sync = rotate = _stub
+LAST = 'LAST'  # last iteration of the preceding pipeline() / systolic(), e.g. `b[LAST]`
 
 
 class _Ns:
@@ -43,4 +44,4 @@ redmule = _Ns()  # gemm / enqueue / commit / start / commit_start / events
 
 __all__ = ['sizes', 'l2', 'define', 'test', 'top', 'l1_kernel', 'fp16', 'u8', 'u16', 'u32', 'i32', 'WFE', 'POLLING',
            'CORE', 'GLOBAL', 'ROW', 'COL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
-           'L1', 'idma', 'redmule']
+           'LAST', 'L1', 'idma', 'redmule']

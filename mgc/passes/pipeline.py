@@ -5,52 +5,47 @@
 # Francesco Conti <f.conti@unibo.it>
 """pipeline: `mg.pipeline` -> explicit, predicated software pipeline.
 
-Body: DMA transfers and jobs (optionally inside tile-invariant `if`s), written
-for one iteration `i`. The pass
+The body is written for one iteration `i`, as `with stage(k):` blocks. Stage
+`k` of iteration `i` runs `k` steps after its stage 0. The pass generates a
+prologue (the stage-0 blocks of iteration 0) and a step loop: in step `s`,
+every block runs in textual order on its own iteration `s + 1 - k`, guarded
+by `0 <= s + 1 - k < n`. A stage may have several blocks, e.g. a stage-0 block
+at the end of the step waits the DMAs issued by the first one.
 
-1. **assigns stages by dependency hops**: an item's stage is 1 + the stage of
-   the latest earlier item that writes a slot it reads (same buffer, same
-   index), else 0. For WS: loads 0, gemm 1, store 2.
-2. **checks multi-buffer depths**: a slot is live from its first to its last
-   stage, so depth >= last - first + 1.
-3. **generates** a prologue (stage 0 of iteration 0) and a step loop. In step
-   `s`, stage k works on iteration s + 1 - k, guarded by 0 <= s + 1 - k < n.
+Checks:
+* depth: a storage indexed `[i + c]` (multi-buffer slot or event-array entry)
+  touched in stages a..b holds b - a + 1 iterations at once, so it needs
+  depth >= b - a + 1. A use of `[i + c]` in stage k counts as stage k - c
+  (it is iteration i + c's slot). A transfer or job keeps its operands (and its event)
+  until the stage of its wait. An omitted depth is inferred.
+* a single buffer written in the loop is touched in one stage only (else the
+  next iteration overwrites it): use a multi-buffer indexed `[i]`. Operands of
+  in-order HWPE jobs count at their enqueue only.
+* every event issued in the body is waited later in the same iteration. An
+  event waited in a later stage than the one issuing it becomes an event
+  array indexed `[i]` (DMA events too: `mg_idma_wait` waits by transfer id).
+* scalars declared in a block are only used in that block.
+* HWPE protocol: per job enqueue -> commit [-> start] -> wait; one simulated
+  run checks that the in-order queue commits/starts the intended jobs and
+  never holds more than `queue_depth` of them.
+* `sync()` in a `pipeline()` stage needs a trip count that is the same on all
+  tiles; `systolic()` stages do not take `sync()`.
 
-An accelerator job is either a one-shot call (`redmule.gemm(...)`: issued and
-waited in its step) or an explicit HWPE protocol, one step per statement:
-
-    redmule.enqueue(x[i], w[i], y, event=ev[i])   # program (addresses only)
-    redmule.commit_start()                         # or commit() [+ start()]
-    ev[i].wait()                                   # lag=1 by default
-
-The protocol steps are placed as follows (`lag=k` adds k stages):
-* commit: in the stage of its latest producer, after it in the step (after
-  the DMA's wait, or after the L1-kernel call); one stage later if the
-  producer is an asynchronous job or the operand is written by another tile
-  (valid only after the barrier);
-* enqueue: with its commit, issued together with the transfers;
-* start: commit + lag; wait: start (or commit_start) + lag, default lag 1.
-  The wait is the writer of the job's outputs for later consumers.
-Checked: one protocol per accelerator, complete and in order; at most
-`queue_depth` jobs between enqueue and wait, and as many event-array entries.
-
-Within a step: (1) transfers, enqueues and one-shot jobs are issued; (2)
-commits/starts follow, each after the waits of the DMAs it needs, so the HWPE
-runs while (3) the CV32 L1 kernels execute, each kernel followed by the
-commits that consume its output; (4) the remaining waits come last, in issue
-order (issues as early as possible, waits as late as possible).
-
-`skew=`/`steps=`/`sync=` make it a systolic pipeline: a global time loop of
-`steps` iterations in which the tile is active when 0 <= t - skew <= last
-step, with a barrier at the end of every time step.
+`systolic` (with `skew`) wraps the steps in a global time loop, identical on
+all tiles, in which the tile is active when 0 <= t - skew <= last step, with a
+barrier ending every time step. Its length is max(skew + n) + S - 2 over the
+mesh: tile-dependent scalars are inlined, and skew + n must be affine in the
+tile ids, so the maximum is at a corner of the mesh.
 
 Code shape matters to GCC (it changes register allocation and the cycle count),
-so the 2-stage shape is the one of the hand-written tests:
-`if (next) {...; wait} else {wait}`; deeper pipelines use per-stage guards.
+so a step with a single guard takes the shape of the hand-written 2-stage
+tests, `if (next) {...; wait} else {wait}`; otherwise consecutive ops with the
+same guard share one `if`.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -122,64 +117,78 @@ def instantiate(op, var, value: Expr):
     return c
 
 
+def _syms(op):
+    """Names used by the expressions of `op` and of the ops nested in it."""
+    out = set()
+
+    def visit(a):
+        if isinstance(a, ir.ExprAttr):
+            out.update(a.data.syms())
+        elif isinstance(a, ir.ViewAttr):
+            for e in a.data.starts + a.data.sizes:
+                out.update(e.syms())
+        elif isinstance(a, ir.EvtAttr) and a.data.index is not None:
+            out.update(a.data.index.syms())
+        elif isinstance(a, ArrayAttr):
+            for x in a.data:
+                visit(x)
+
+    for o in op.walk():
+        for a in o.attributes.values():
+            visit(a)
+    return out
+
+
 # ----------------------------------------------------------------------------
 # body analysis
 # ----------------------------------------------------------------------------
 
 
 @dataclass(eq=False)
-class Item:
-    """One schedulable element of a pipeline body (a DMA, a job, an HWPE
-    protocol step, or an `if` wrapping transfers and jobs), with the buffer
-    slots it reads/writes, the events it signals and the `stage` assigned to it.
-
-    Protocol steps (`proto` set) belong to the `job` enqueued by an `enqueue`
-    item, whose `parts` names its `commit`, `start` and `wait` steps
-    (`commit_start` is both commit and start). `live`: slots a step keeps busy
-    (all the job's operands, from commit to wait), for the depth check."""
-    op: object  # IdmaOp | JobOp | HwpeOp | WaitOp | IfOp (predicated)
-    reads: set = field(default_factory=set)
-    writes: set = field(default_factory=set)
-    events: list = field(default_factory=list)  # (EvtRef, unconditional)
-    is_job: bool = False
-    stage: int = 0
-    proto: Optional[str] = None  # enqueue | commit | start | commit_start | wait
-    acc: Optional[str] = None
-    lag: int = 0
-    job: Optional['Item'] = None
-    parts: dict = field(default_factory=dict)  # enqueue only: commit / start / wait -> Item
-    live: set = field(default_factory=set)
-    prods: list = field(default_factory=list)  # earlier items writing a slot this one reads
+class Block:
+    """A `with stage(k):` block; `pos` is its textual position in the body."""
+    k: int
+    pos: int
+    op: ir.StageOp
 
     @property
-    def is_transfer(self):
-        return self.proto is None and not self.is_job
+    def ops(self):
+        return list(self.op.body.block.ops)
 
 
-def _offset(idx: Expr, var: str):
-    """Slot index -> ('rel', k) for var + k, ('abs', text) otherwise."""
+@dataclass(eq=False)
+class Use:
+    """One op of the body, in iteration order: (stage, block, position)."""
+    op: object
+    block: Block
+    order: tuple
+
+    @property
+    def k(self):
+        return self.block.k
+
+
+@dataclass(eq=False)
+class Issue:
+    """An op completing on an event (DMA, accelerator job), with the wait(s)
+    that end it; `last` is the stage of the (latest) wait."""
+    use: Use
+    key: tuple
+    waits: List[Use] = field(default_factory=list)
+
+    @property
+    def last(self):
+        return max([w.k for w in self.waits], default=self.use.k)
+
+
+def _slot(idx: Expr, var: str):
+    """Slot index -> ('rel', c) for var + c, ('abs', text) otherwise."""
     if var in idx.syms():
-        k = const_of(sub(idx, Sym(var), fold=False))
-        if k is None:
+        c = const_of(sub(idx, Sym(var), fold=False))
+        if c is None:
             raise MgcError(None, f'slot index `{idx.c()}` must be `{var} + constant`')
-        return ('rel', k)
+        return ('rel', c)
     return ('abs', idx.c())
-
-
-def _accesses(op, var, kdefs):
-    """(reads, writes) of buffer slots for a DMA or job."""
-    if isinstance(op, ir.IdmaOp):
-        key = (alloc_of(op.local).sym.data, _offset(op.slot.data, var))
-        return ({key}, set()) if op.dir.data == 1 else (set(), {key})
-    roles = _roles(op, kdefs)
-    reads, writes = set(), set()
-    for v, s, role in zip(op.bufs, op.slots.data, roles):
-        key = (alloc_of(v).sym.data, _offset(s.data, var))
-        if role in ('in', 'inout'):
-            reads.add(key)
-        if role in ('out', 'inout'):
-            writes.add(key)
-    return reads, writes
 
 
 def _roles(job, kdefs):
@@ -194,115 +203,37 @@ def _roles(job, kdefs):
     return [o.data.partition(':')[2] for o in kdefs[k].operands_.data]
 
 
-def _item(op, var, kdefs) -> Item:
-    """Analyse one pipeline-body op into an `Item`; rejects anything that is not
-    a transfer, a job or an `if` independent of the iteration variable."""
-    if isinstance(op, (ir.IdmaOp, ir.JobOp)):
-        r, w = _accesses(op, var, kdefs)
-        ev = [] if op.event is None else [(op.event.data, True)]
-        return Item(op, r, w, ev, isinstance(op, ir.JobOp), live=r | w)
-    if isinstance(op, ir.HwpeOp):
-        # dependencies and live slots are filled in when the steps are bound to their enqueue
-        lag = op.lag.data if op.lag is not None else 0
-        return Item(op, proto=op.action.data, acc=op.acc.data, lag=lag)
-    if isinstance(op, ir.WaitOp):
-        if op.event.data.kind == 'idma':
-            raise MgcError(op, 'DMA waits inside pipeline() are placed automatically: drop this `.wait()`')
-        lag = op.lag.data if op.lag is not None else 1
-        return Item(op, proto='wait', lag=lag)
-    if isinstance(op, ir.IfOp):
-        if var in op.cond.data.syms():
-            raise MgcError(op, f'conditions inside pipeline() must not depend on `{var}` (they predicate whole items)')
-        it = Item(op)
-        branches = []
-        for reg in (op.then, op.else_):
-            keys = set()
-            for o in reg.block.ops:
-                if isinstance(o, (ir.CommentOp, ir.RemoteOp)):
-                    continue
-                if not isinstance(o, (ir.IdmaOp, ir.JobOp)):
-                    raise MgcError(o, 'a predicated pipeline item contains only transfers and jobs')
-                r, w = _accesses(o, var, kdefs)
-                it.reads |= r
-                it.writes |= w
-                it.is_job |= isinstance(o, ir.JobOp)
-                if o.event is not None:
-                    keys.add(o.event.data.key())
-                    if not any(e.key() == o.event.data.key() for e, _ in it.events):
-                        it.events.append((o.event.data, False))
-            branches.append(keys)
-        both = branches[0] & branches[1]
-        it.events = [(e, e.key() in both) for e, _ in it.events]
-        it.live = it.reads | it.writes
-        return it
-    raise MgcError(op, 'pipeline() bodies contain transfers, jobs, HWPE protocol steps and tile-invariant ifs')
+def _evkey(e: ir.EvtRef, var):
+    """Identity of the storage an event names, within one iteration."""
+    if e.kind == 'array':
+        return ('array', e.name, None, _slot(e.index, var))
+    return (e.kind, e.name, e.dir, None)
 
 
-def _same_event(a: ir.EvtRef, b: ir.EvtRef):
-    """True if `a` and `b` name the same event storage (`ev[i]` and `ev[i]`)."""
-    ia = a.index.c() if a.index is not None else None
-    ib = b.index.c() if b.index is not None else None
-    return (a.kind, a.name, ia) == (b.kind, b.name, ib)
+def _issues(op):
+    """True if `op` completes on an event that a `.wait()` must consume."""
+    if isinstance(op, ir.IdmaOp):
+        return True
+    if isinstance(op, ir.JobOp):
+        return op.event is not None
+    return isinstance(op, ir.HwpeOp) and op.action.data in ('enqueue', 'oneshot')
 
 
-def _bind(items, var, kdefs):
-    """Attach every protocol step to its enqueue, check the protocol order
-    (enqueue -> commit [-> start] or commit_start -> wait, one job per
-    accelerator) and give each step the job's slots."""
-    jobs = {}  # acc -> enqueue item
-    for it in items:
-        if it.proto is None:
-            continue
-        if it.proto == 'enqueue':
-            if it.acc in jobs:
-                raise MgcError(it.op, f'one {it.acc} job per pipeline() body: the hardware queue commits '
-                               'in order, so two jobs would interleave')
-            jobs[it.acc] = it.job = it
-            r, w = _accesses(it.op, var, kdefs)
-            it.live = r | w
-            continue
-        if it.proto == 'wait':
-            e = it.op.event.data
-            j = next((q for q in jobs.values() if _same_event(q.op.event.data, e)), None)
-            if j is None:
-                raise MgcError(it.op, 'inside pipeline(), `.wait()` is for the event of a job enqueued earlier '
-                               'in the same body')
-            it.acc = j.acc
-        else:
-            j = jobs.get(it.acc)
-            if j is None:
-                raise MgcError(it.op, f'{it.acc}.{it.proto}() needs an earlier {it.acc}.enqueue() in the same '
-                               'pipeline() body')
-        it.job = j
-        p = j.parts
-        if it.proto in ('commit', 'commit_start') and 'commit' in p:
-            raise MgcError(it.op, f'this {it.acc} job is already committed')
-        if it.proto == 'start' and ('commit' not in p or 'start' in p):
-            raise MgcError(it.op, f'{it.acc}.start() needs an earlier {it.acc}.commit() of the same job, '
-                           'and only one start')
-        if it.proto == 'wait' and ('start' not in p or 'wait' in p):
-            raise MgcError(it.op, 'the job is waited before it is started, or waited twice')
-        if it.proto in ('commit', 'commit_start'):
-            p['commit'] = it
-        if it.proto in ('start', 'commit_start'):
-            p['start'] = it
-        if it.proto == 'wait':
-            p['wait'] = it
-        r, w = _accesses(j.op, var, kdefs)
-        it.live = r | w
-        if it.proto in ('commit', 'commit_start'):
-            it.reads = r  # the operands must be in L1 when the job is committed
-        if it.proto == 'wait':
-            it.writes = w  # ... and its results are there once it is waited
-    for acc, j in jobs.items():
-        for part, how in (('commit', 'commit_start() or commit()'), ('start', 'start()'), ('wait', 'a .wait()')):
-            if part not in j.parts:
-                raise MgcError(j.op, f'this {acc} job needs {how} in the same pipeline() body')
-        for it in items:
-            if it.is_job and any(isinstance(o, ir.JobOp) and o.kernel.data.startswith(acc + '.')
-                                 for o in it.op.walk()):
-                raise MgcError(it.op, f'{acc} is driven explicitly (enqueue / commit / wait) in this pipeline(): '
-                               f'write this job the same way')
+def _buffers(op, var, kdefs, remote):
+    """(alloc, slot, written) for each L1 buffer `op` names. `remote`: also
+    the destination of a store to other tiles (same step on every tile)."""
+    out = []
+    if isinstance(op, ir.IdmaOp):
+        slot = _slot(op.slot.data, var)
+        out.append((alloc_of(op.local), slot, op.dir.data == 0))
+        if remote and op.remote is not None:
+            r = op.remote.owner
+            out.append((alloc_of(op.remote), ('abs', 'block') if r.view is not None else slot, True))
+        return out
+    if isinstance(op, (ir.JobOp, ir.HwpeOp)) and len(op.bufs):
+        for v, s, role in zip(op.bufs, op.slots.data, _roles(op, kdefs)):
+            out.append((alloc_of(v), _slot(s.data, var), role in ('out', 'inout')))
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -310,87 +241,68 @@ def _bind(items, var, kdefs):
 
 @dataclass(frozen=True)
 class Pipeline(ModulePass):
-    """Expands `for i in pipeline(n)` into an explicit software pipeline.
+    """Expands `for i in pipeline(n)` / `systolic(n, skew=...)` into an explicit
+    software pipeline (see the module docstring).
 
-    Example, output-static GEMM body (`idma.load(x[i], ...)`, `redmule.enqueue(x[i], w, y,
-    event=ev[i])`, `redmule.commit_start()`, `ev[i].wait()`): the load, enqueue and
-    commit are stage 0 and the wait stage 1, so the result is a prologue that
-    loads and commits iteration 0, then a loop where step `s` loads and commits
-    iteration `s + 1` while RedMulE computes iteration `s`, then waits for it.
-    See the module docstring for the stage/guard rules.
-    Errors: empty body, no dependency between items (nothing to pipeline),
-    multi-buffer too shallow for the stages it spans, more than one pipeline,
-    incomplete or misordered protocol, too many jobs in flight.
+    Example, output-static GEMM: `stage(0)` loads `x[i]`, `w[i]`, enqueues the
+    job on `ev[i]`, waits the loads and commits; `stage(1)` waits `ev[i]`. The
+    result is a prologue that loads and commits iteration 0, then a loop where
+    step `s` loads and commits iteration `s + 1` while RedMulE computes
+    iteration `s`, then waits for it.
     """
     name = 'pipeline'
 
     def apply(self, ctx, module):
         pipes = [op for op in module.walk() if isinstance(op, ir.PipelineOp)]
         if len(pipes) > 1:
-            raise MgcError(pipes[1], 'only one pipeline() per test is supported for now')
+            raise MgcError(pipes[1], 'only one pipeline() or systolic() per test is supported for now')
         for p in pipes:
             self.expand(module, p)
+        for o in module.walk():
+            if isinstance(o, ir.AllocOp) and o.depth.data == 0:
+                raise MgcError(o, f'`{o.sym.data}` is not used by a pipeline(): give it a depth= '
+                                  '(only pipeline() and systolic() infer it)')
+            if isinstance(o, ir.EventsOp) and o.depth.data == 0:
+                raise MgcError(o, f'`{o.sym.data}` is not used by a pipeline(): give it a size, '
+                                  f'{o.kind.data}.events(n)')
 
     def expand(self, module, p):
-        """Replace the `mg.pipeline` op `p` with prologue + loop (steps 1-3 of the module docstring)."""
+        """Replace the `mg.pipeline` op `p` with prologue + loop."""
         var = p.var.data
         n = p.n.data
+        systolic = p.kind.data == 'systolic'
         kdefs = kernels(module)
-        docs, items = [], []
+        docs, blocks = [], []
         for op in list(p.body.block.ops):
-            if isinstance(op, ir.CommentOp):
-                if not items:
-                    op.detach()
-                    docs.append(op)
-                continue
-            items.append(_item(op, var, kdefs))
-        if not items:
-            raise MgcError(p, 'empty pipeline() body')
-        _bind(items, var, kdefs)
-
-        # 1. stages by dependency hops (HWPE protocol steps: see the module docstring)
-        remote_written = {alloc_of(r.res).sym.data for r in module.walk() if isinstance(r, ir.RemoteOp)}
-        for k, it in enumerate(items):
-            it.prods = [q for q in items[:k] if q.writes & it.reads]
-            if it.proto == 'enqueue':
-                continue  # placed with its commit, below
-            if it.proto in ('commit', 'commit_start'):
-                it.stage = it.lag + max((self.commit_stage(q, it, remote_written) for q in it.prods), default=0)
-            elif it.proto == 'start':
-                it.stage = it.job.parts['commit'].stage + it.lag
-            elif it.proto == 'wait':
-                it.stage = it.job.parts['start'].stage + it.lag
-            else:
-                it.stage = 1 + max(q.stage for q in it.prods) if it.prods else 0
-        for it in items:
-            if it.proto == 'enqueue':
-                it.stage = it.parts['commit'].stage
-        S = 1 + max(it.stage for it in items)
+            if isinstance(op, ir.StageOp):
+                blocks.append(Block(op.k.data, len(blocks), op))
+            elif isinstance(op, ir.CommentOp) and not blocks:
+                op.detach()
+                docs.append(op)
+        S = 1 + max(b.k for b in blocks)
         if S < 2:
-            raise MgcError(p, 'nothing to pipeline: no item consumes what another produces')
+            raise MgcError(p, f'{p.kind.data}() needs at least two stages: stage(0) and stage(1)')
 
-        # 2. jobs in flight, multi-buffer depths
-        self.check_in_flight(module, items, var)
-        allocs = {a.sym.data: a for a in module.walk() if isinstance(a, ir.AllocOp)}
-        span = {}
-        for it in items:
-            for b, (kind, _) in it.live:
-                if kind == 'rel':
-                    lo, hi = span.get(b, (it.stage, it.stage))
-                    span[b] = (min(lo, it.stage), max(hi, it.stage))
-        for b, (lo, hi) in span.items():
-            need = hi - lo + 1
-            if allocs[b].depth.data < need:
-                raise MgcError(allocs[b], f'multi-buffer `{b}` is live across {need} pipeline stages: '
-                               f'declare it with depth={need} or more')
+        # every op in iteration order: by stage, then by block, then in the block
+        uses = []
+        for b in sorted(blocks, key=lambda b: (b.k, b.pos)):
+            for j, o in enumerate(o for top in b.ops for o in top.walk()):
+                uses.append(Use(o, b, (b.k, b.pos, j)))
 
-        skew = p.skew.data if p.skew is not None else None
+        self.check_syncs(p, uses, systolic)
+        self.check_scalars(blocks)
+        issues = self.match_events(uses, var)
+        self.check_hwpe(uses, issues, blocks, var)
+        self.cross_stage_events(module, p, issues, var)
+        table = self.depths(module, uses, issues, var, kdefs, remote=not systolic)
+
         step = Sym(var, None, 'int')
-        out = self.prologue(p, items, var)
+        out = self.prologue(p, blocks, var)
         out += docs
-        body = self.step(items, var, step, n, S)
+        out.append(self.schedule_doc(p, S, table))
+        body = self.step(blocks, var, step, n, S)
 
-        if skew is None:
+        if not systolic:
             hi = add(n, Const(S - 2)) if S > 2 else n
             loop_body = body
             if p.sync is not None:
@@ -399,15 +311,15 @@ class Pipeline(ModulePass):
                                                    'hi': ir.E(hi), 'ctype': StringAttr(step.ctype)},
                                        regions=[_region(loop_body)]))
         else:
+            skew = p.skew.data
             t = p.time.data if p.time is not None else 't'
-            steps = p.steps.data
+            steps = add(self.mesh_max(p, add(skew, n)), Const(S - 2))
             last = add(n, Const(S - 3)) if S >= 3 else sub(n, Const(1))
             active = Logic('&&', [Cmp('>=', step, Const(0)), Cmp('<=', step, last)])
             loop_body = [ir.ScalarOp.create(attributes={'sym': StringAttr(var), 'ctype': StringAttr('int'),
                                                         'value': ir.E(sub(Sym(t), skew)), 'decl': IntAttr(1)}),
-                         if_(active, body)]
-            if p.sync is not None:
-                loop_body.append(self.sync(p))
+                         if_(active, body),
+                         self.sync(p)]
             out.append(ir.ForOp.create(attributes={'var': StringAttr(t), 'lo': ir.E(Const(0)),
                                                    'hi': ir.E(steps), 'ctype': StringAttr('int')},
                                        regions=[_region(loop_body)]))
@@ -419,19 +331,280 @@ class Pipeline(ModulePass):
         p.detach()
         p.erase()
 
+    # -- checks --------------------------------------------------------------
+    def check_syncs(self, p, uses, systolic):
+        """`sync()` inside stages: every tile of the scope must run the same
+        steps, so the trip count may not depend on the tile; never in systolic()."""
+        syncs = [u.op for u in uses if isinstance(u.op, ir.SyncOp)]
+        if not syncs:
+            return
+        if systolic:
+            raise MgcError(syncs[0], 'no sync() inside systolic(): tiles run different iterations in the same '
+                                     'step; the barrier ending each step is `sync=`')
+        mesh, dep, defs = self.tile_deps(p)
+        e = self.inline(p.n.data, defs)
+        bad = e.syms() & (dep | set(mesh))
+        if bad:
+            raise MgcError(syncs[0], f'sync() inside pipeline() needs a trip count that is the same on every tile, '
+                                     f'but it depends on {", ".join(sorted(bad))}')
+
+    @staticmethod
+    def check_scalars(blocks):
+        """A scalar declared in a block is used only in that block: elsewhere
+        it would belong to another iteration (or to another C scope)."""
+        decl = {}
+        for b in blocks:
+            for o in (o for top in b.ops for o in top.walk()):
+                if isinstance(o, ir.ScalarOp) and o.decl.data:
+                    if o.sym.data in decl and decl[o.sym.data][0] is not b:
+                        raise MgcError(o, f'`{o.sym.data}` is declared in two stage blocks: use two names')
+                    decl[o.sym.data] = (b, o)
+        for b in blocks:
+            for top in b.ops:
+                for name in _syms(top):
+                    if name in decl and decl[name][0] is not b:
+                        raise MgcError(top, f'`{name}` is declared in a stage({decl[name][0].k}) block and used in '
+                                            f'another block, where it would be stale: compute it in this block')
+
+    @staticmethod
+    def match_events(uses, var) -> List[Issue]:
+        """Pair each `.wait()` with the transfers/jobs issued earlier in the same
+        iteration on the same event storage (both branches of an `if` may issue
+        it); every issue must be waited."""
+        pending, issues = {}, []
+        for u in uses:
+            if _issues(u.op):
+                it = Issue(u, _evkey(u.op.event.data, var))
+                pending.setdefault(it.key, []).append(it)
+                issues.append(it)
+            elif isinstance(u.op, ir.WaitOp):
+                key = _evkey(u.op.event.data, var)
+                its = pending.pop(key, None)
+                if not its:
+                    raise MgcError(u.op, f'this wait (stage {u.k}) has no transfer or job issued before it in the same '
+                                         f'iteration: waits go in the issuing stage or a later one')
+                for it in its:
+                    it.waits.append(u)
+        for its in pending.values():
+            raise MgcError(its[0].use.op, f'this transfer/job (stage {its[0].use.k}) is never waited in the loop body')
+        return issues
+
+    def check_hwpe(self, uses, issues, blocks, var):
+        """Protocol of every explicit job (enqueue -> commit [-> start] -> wait,
+        in iteration order), then one simulated run of the schedule: the in-order
+        queue must commit/start the job each step means, and hold at most
+        `queue_depth` jobs (enqueued, not yet waited)."""
+        waits = {id(w.op): it for it in issues for w in it.waits}
+        jobs = {}  # acc -> jobs of this iteration, each {'enqueue': Use, 'commit': ..., 'start': ..., 'wait': ...}
+        role = {}  # id(op) -> (acc, job, step name)
+        for u in uses:
+            o = u.op
+            if isinstance(o, ir.HwpeOp) and o.action.data == 'enqueue':
+                j = {'enqueue': u}
+                jobs.setdefault(o.acc.data, []).append(j)
+                role[id(o)] = (o.acc.data, j, 'enqueue')
+            elif isinstance(o, ir.JobOp) and '.' in o.kernel.data:
+                j = {'enqueue': u, 'commit': u, 'start': u}
+                jobs.setdefault(o.kernel.data.split('.')[0], []).append(j)
+                role[id(o)] = (o.kernel.data.split('.')[0], j, 'oneshot')
+            elif isinstance(o, ir.HwpeOp):
+                acc, act = o.acc.data, o.action.data
+                steps = {'commit': ['commit'], 'start': ['start'], 'commit_start': ['commit', 'start']}[act]
+                for s in steps:
+                    prev = 'enqueue' if s == 'commit' else 'commit'
+                    j = next((j for j in jobs.get(acc, []) if prev in j and s not in j), None)
+                    if j is None:
+                        raise MgcError(o, f'{acc}.{act}() needs an earlier {acc}.{prev}() in the same iteration '
+                                          '(stage order, then block order)')
+                    j[s] = u
+                role[id(o)] = (acc, j, act)
+            elif isinstance(o, ir.WaitOp) and id(o) in waits:
+                src = waits[id(o)].use.op
+                if id(src) in role:
+                    acc, j, _ = role[id(src)]
+                    if 'start' not in j:
+                        raise MgcError(o, f'this {acc} job is waited before it is started')
+                    j['wait'] = u
+                    role[id(o)] = (acc, j, 'wait')
+        for acc, js in jobs.items():
+            for j in js:
+                for s, how in (('commit', 'commit_start() or commit()'), ('start', 'start()'), ('wait', 'a .wait()')):
+                    if s not in j:
+                        raise MgcError(j['enqueue'].op, f'this {acc} job needs {how} in the same iteration')
+        if not role:
+            return
+
+        # simulated run: 2S + 2 iterations, prologue (step -1) included
+        S = 1 + max(b.k for b in blocks)
+        n = 2 * S + 2
+        queue = {acc: [] for acc in jobs}  # entries [iteration, job, committed, started]
+        for s in range(-1, n + S - 2):
+            for b in blocks:
+                it = s + 1 - b.k
+                if not 0 <= it < n or (s == -1 and b.k != 0):
+                    continue
+                for o in (o for top in b.ops for o in top.walk()):
+                    if id(o) not in role:
+                        continue
+                    acc, j, act = role[id(o)]
+                    q = queue[acc]
+                    if act in ('enqueue', 'oneshot'):
+                        q.append([it, j, act == 'oneshot', act == 'oneshot'])
+                        qd = devices.HWPES[acc].queue_depth
+                        if len(q) > qd:
+                            raise MgcError(o, f'{acc} holds {qd} jobs, but {len(q)} would be in flight here '
+                                              f'(iterations {", ".join(str(e[0]) for e in q)}): wait a job earlier')
+                    if act in ('commit', 'commit_start'):
+                        self.hw_step(o, acc, q, it, j, 2, 'commit')
+                    if act in ('start', 'commit_start'):
+                        self.hw_step(o, acc, q, it, j, 3, 'start')
+                    if act == 'wait':
+                        q[:] = [e for e in q if not (e[0] == it and e[1] is j)]
+
+    @staticmethod
+    def hw_step(o, acc, q, it, j, f, what):
+        """Commit/start the oldest job not yet committed/started, as the hardware
+        does; it must be the job of iteration `it` this statement belongs to."""
+        e = next((e for e in q if not e[f]), None)
+        if e is None or e[0] != it or e[1] is not j:
+            got = 'no job' if e is None else f'the job of iteration {e[0]} (stage {e[1]["enqueue"].k})'
+            raise MgcError(o, f'{acc}.{what}() of iteration {it} would {what} {got}: the hardware queue '
+                              f'{what}s jobs in enqueue order')
+        e[f] = True
+
+    @staticmethod
+    def cross_stage_events(module, p, issues, var):
+        """An event waited in a later stage than the one issuing it is in flight
+        for several iterations: give it per-iteration storage, a new event
+        array indexed by `var` (DMA events and the default job event)."""
+        cross = {}
+        for it in issues:
+            if it.last > it.use.k and it.key[0] != 'array':
+                cross[it.key] = None
+        arrays = []
+        for key in cross:
+            kind, name, d, _ = key
+            if kind == 'idma':
+                arr, ekind = f'idma_evts_{name}_{"out" if d else "in"}', 'idma'
+            else:
+                arr, ekind = f'{name}_evts', name
+            cross[key] = arr
+            arrays.append(ir.EventsOp.create(attributes={'sym': StringAttr(arr), 'depth': IntAttr(0),
+                                                         'kind': StringAttr(ekind)}))
+        if not cross:
+            return
+        for it in issues:
+            if it.key in cross:
+                for u in [it.use] + it.waits:
+                    e = u.op.event.data
+                    u.op.attributes['event'] = ir.EvtAttr(ir.EvtRef('array', cross[it.key], e.dir, Sym(var)))
+                it.key = ('array', cross[it.key], None, ('rel', 0))
+        Rewriter.insert_op(arrays, InsertPoint.before(p))
+
+    def depths(self, module, uses, issues, var, kdefs, remote):
+        """Stages touched by each storage indexed `[var + c]`: an op touches its
+        buffers in its stage, and keeps those of a transfer/job (and its event)
+        until its wait. Slot `var + c` in stage k belongs to iteration var + c,
+        for which it is stage k - c. Infers omitted depths, checks the others,
+        and checks the single-buffer rule. Returns the schedule table
+        [(name, lo, hi, depth)]."""
+        last = {id(it.use.op): it.last for it in issues}
+        span, single = {}, {}
+        allocs = {}
+        for u in uses:
+            hi = last.get(id(u.op), u.k)
+            for a, slot, written in _buffers(u.op, var, kdefs, remote):
+                allocs[a.sym.data] = a
+                if slot[0] == 'rel' and a.depth.data != 1:
+                    c = slot[1]
+                    lo0, hi0 = span.get(('buf', a.sym.data), (u.k - c, hi - c))
+                    span[('buf', a.sym.data)] = (min(lo0, u.k - c), max(hi0, hi - c))
+                else:
+                    st, w = single.get(a.sym.data, (set(), False))
+                    single[a.sym.data] = (st | {u.k}, w or written)
+        for name, (st, written) in single.items():
+            if written and len(st) > 1:
+                ks = sorted(st)
+                raise MgcError(allocs[name], f'`{name}` is written in the loop and used in stages '
+                                             f'{", ".join(map(str, ks))}: while stage {ks[-1]} works on iteration i, '
+                                             f'stage {ks[0]} already writes it for iteration i + {ks[-1] - ks[0]}. '
+                                             f'Make it a multi_buffer indexed [{var}], or use it in one stage only')
+        evarrays = {o.sym.data: o for o in module.walk() if isinstance(o, ir.EventsOp)}
+        for it in issues:
+            if it.key[0] == 'array' and it.key[3][0] == 'rel':
+                k, c = ('evt', it.key[1]), it.key[3][1]
+                lo0, hi0 = span.get(k, (it.use.k - c, it.last - c))
+                span[k] = (min(lo0, it.use.k - c), max(hi0, it.last - c))
+        table = []
+        for (kind, name), (lo, hi) in span.items():
+            op = allocs[name] if kind == 'buf' else evarrays[name]
+            need = hi - lo + 1
+            what = (f'multi-buffer `{name}`' if kind == 'buf' else f'event array `{name}`')
+            if op.depth.data == 0:
+                op.attributes['depth'] = IntAttr(max(2, need) if kind == 'buf' else need)
+            elif op.depth.data < need:
+                fix = 'depth=' if kind == 'buf' else f'{op.kind.data}.events('
+                raise MgcError(op, f'{what} is used in stages {lo}..{hi}, so it holds {need} iterations at once: '
+                                   f'declare it with {fix}{need}{"" if kind == "buf" else ")"} or more (or omit it)')
+            table.append((name, lo, hi, op.depth.data))
+        return table
+
+    # -- tiles ---------------------------------------------------------------
+    @staticmethod
+    def tile_deps(p):
+        """(mesh axes -> extent macro, names whose value differs between tiles,
+        inlinable definitions of those names)."""
+        tiles = p.parent_op()
+        while not isinstance(tiles, ir.TilesOp):
+            tiles = tiles.parent_op()
+        mesh = {tiles.y.data: 'MESH_Y_TILES', tiles.x.data: 'MESH_X_TILES'}
+        dep = set(mesh)
+        defs = {}
+        for op in tiles.walk():
+            if isinstance(op, ir.SplitOp):
+                dep.add(op.sym.data)
+            elif isinstance(op, ir.ScalarOp) and op.value.data.syms() & dep:
+                dep.add(op.sym.data)
+                if op.decl.data:
+                    defs[op.sym.data] = op.value.data
+                else:
+                    defs.pop(op.sym.data, None)  # reassigned: not inlinable
+        return mesh, dep, defs
+
+    @staticmethod
+    def inline(e, defs):
+        while (names := e.syms() & set(defs)):
+            e = e.subst({k: defs[k] for k in names})
+        return e
+
+    def mesh_max(self, p, e):
+        """Maximum of `e` over all tiles, as an expression valid on every tile.
+
+        Scalars that depend on the tile ids are inlined (they must be declared
+        once); the result must be affine in the tile ids with constant
+        coefficients, so the maximum is at a mesh corner: e.g. `y_id * 2 + n`
+        -> `(MESH_Y_TILES - 1) * 2 + n`."""
+        mesh, dep, defs = self.tile_deps(p)
+        e = self.inline(e, defs)
+        bad = (e.syms() & dep) - set(mesh)
+        if bad:
+            raise MgcError(p, f'systolic(): cannot compute the time steps of the mesh: skew + n depends on '
+                              f'{", ".join(sorted(bad))}, which is not a single assignment of the tile ids')
+        poly = e.poly()
+        corner = {}
+        for v, extent in mesh.items():
+            coef = poly.get((v,), 0)
+            if any(re.search(rf'\b{v}\b', a) for k in poly if k != (v,) for a in k):
+                raise MgcError(p, f'systolic(): skew + n must be affine in {v} with a constant coefficient')
+            corner[v] = sub(Sym(extent), Const(1)) if coef > 0 else Const(0)
+        return e.subst(corner)
+
     @staticmethod
     def sync(p):
         """Barrier op for the pipeline's `sync=` scope."""
         return ir.SyncOp.create(attributes={'scope': StringAttr(p.sync.data)})
 
-    @staticmethod
-    def is_sync(it: Item) -> bool:
-        """True if the item runs a synchronous software kernel (occupies the core)."""
-        ops = [it.op] if not isinstance(it.op, ir.IfOp) else \
-            [o for r in (it.op.then, it.op.else_) for o in r.block.ops]
-        return any(isinstance(o, ir.JobOp) and '.' not in o.kernel.data for o in ops)
-
-    # -- guards ------------------------------------------------------------
+    # -- schedule --------------------------------------------------------------
     @staticmethod
     def guard(k, S, step, n) -> Optional[Expr]:
         """Stage k works on iteration step + 1 - k: needs 0 <= step + 1 - k < n."""
@@ -445,7 +618,6 @@ class Pipeline(ModulePass):
             return None
         return conds[0] if len(conds) == 1 else Logic('&&', conds)
 
-    # -- outer pending events (issued before the pipeline, not yet waited) ---
     @staticmethod
     def outer_pending(p):
         """DMA events issued before the pipeline and not yet waited (e.g. a weight
@@ -460,149 +632,39 @@ class Pipeline(ModulePass):
                 pending = [e for e in pending if e.key() != op.event.data.key()]
         return pending
 
-    @staticmethod
-    def waits_for(it: Item, pred_op=None):
-        """Waits for an item's events (predicated ones inside the item's condition)."""
-        out = []
-        for e, uncond in it.events:
-            w = wait(ir.EvtRef(e.kind, e.name, e.dir, e.index))
-            out.append(w if uncond or not isinstance(it.op, ir.IfOp) else if_(it.op.cond.data, [w]))
-        return out
-
-    # -- HWPE protocol: placement and checks -------------------------------------
-    def commit_stage(self, q: Item, c: Item, remote_written) -> int:
-        """Earliest stage at which commit `c` may follow its producer `q`: the
-        same stage (after the DMA's wait, or after the L1-kernel call), or the
-        next one if `q` is an asynchronous job / job wait, or if the operand is
-        written by another tile (valid only after the barrier)."""
-        if any(b in remote_written for b, _ in q.writes & c.reads):
-            return q.stage + 1
-        if q.is_transfer or (q.is_job and self.is_sync(q)):
-            return q.stage
-        return q.stage + 1
-
-    @staticmethod
-    def check_in_flight(module, items, var):
-        """At most `queue_depth` jobs between enqueue and wait, and an event
-        storage for each of them. Step `s` names the events `ev[s + 1 - stage]`,
-        so the array must also be deeper than the largest such offset."""
-        evarrays = {o.sym.data: o.depth.data for o in module.walk() if isinstance(o, ir.EventsOp)}
-        for j in items:
-            if j.proto != 'enqueue':
-                continue
-            w = j.parts['wait']
-            n = w.stage - j.stage + 1
-            qd = devices.HWPES[j.acc].queue_depth
-            if n > qd:
-                raise MgcError(w.op, f'{j.acc} holds {qd} jobs, but {n} would be in flight (enqueue at stage '
-                               f'{j.stage}, wait at stage {w.stage}): lower `lag=`')
-            e = j.op.event.data
-            need = max(n, abs(1 - j.stage) + 1, abs(1 - w.stage) + 1)
-            if e.kind == 'array' and evarrays.get(e.name, need) < need:
-                raise MgcError(j.op, f'{n} jobs are in flight (enqueue at stage {j.stage}, wait at stage '
-                               f'{w.stage}): declare `{e.name}` with {j.acc}.events({need}) or more')
-            if e.kind != 'array' and n > 1:
-                raise MgcError(j.op, f'{n} jobs are in flight, each needs its own event: pass '
-                               f'`event=ev[{var}]` with ev = {j.acc}.events({n})')
-
-    # -- schedule --------------------------------------------------------------
-    def order(self, sel):
-        """Issue order of the items `sel` running in one step, as a list of
-        ('issue', item) / ('wait', item) (the item's DMA or one-shot job waits):
-
-        1. transfers, enqueues and one-shot jobs;
-        2. commits/starts, each after the waits of the same-stage DMAs it needs;
-        3. L1-kernel calls, each followed by the commits/starts that need it;
-        4. the remaining waits, in issue order.
-        """
-        def stage(it):
-            return it.stage
-
-        transfers = sorted([it for it in sel if it.is_transfer], key=stage)
-        enqueues = [it for it in sel if it.proto == 'enqueue']
-        # asynchronous jobs before synchronous (core) calls: a call occupies the
-        # control core, so everything that can run meanwhile must already be issued
-        jobs = sorted([it for it in sel if it.is_job], key=lambda it: (self.is_sync(it), it.stage))
-        asyncs = [it for it in jobs if not self.is_sync(it)]
-        calls = [it for it in jobs if self.is_sync(it)]
-        steps = [it for it in sel if it.proto in ('commit', 'start', 'commit_start')]
-        waited = set()
-
-        def commit_of(c):
-            return c.job.parts['commit']
-
-        def call_before(c):
-            """The same-stage L1-kernel call a commit/start must follow, if any."""
-            cm = commit_of(c)
-            if cm.stage != c.stage:
-                return None
-            ks = [q for q in cm.prods if q in sel and q.stage == c.stage and q.is_job and self.is_sync(q)]
-            return ks[-1] if ks else None
-
-        def ready(c):
-            out = []
-            for q in commit_of(c).prods:
-                if q in sel and q.stage == c.stage and q.is_transfer and q not in waited:
-                    waited.add(q)
-                    out.append(('wait', q))
-            return out + [('issue', c)]
-
-        out = [('issue', it) for it in transfers + enqueues + asyncs]
-        for c in steps:
-            if call_before(c) is None:
-                out += ready(c)
-        for k in calls:
-            out.append(('issue', k))
-            for c in steps:
-                if call_before(c) is k:
-                    out += ready(c)
-        out += [('wait', it) for it in transfers + asyncs if it not in waited]
-        out += [('issue', it) for it in sel if it.proto == 'wait']
-        return out
-
-    def emit(self, tokens, var, at, guard):
-        """(guard, op) list for `order()` tokens: each item instantiated for its
-        iteration `at(item)`, under `guard(item)`."""
-        seq = []
-        for kind, it in tokens:
-            ops = [it.op] if kind == 'issue' else self.waits_for(it)
-            for o in ops:
-                c = instantiate(o, var, at(it))
-                if isinstance(c, (ir.HwpeOp, ir.WaitOp)):
-                    c.attributes.pop('lag', None)
-                seq.append((guard(it), c))
-            if kind == 'wait':
-                for o in ops:
-                    o.erase()
-        return seq
-
-    def prologue(self, p, items, var):
-        """Stage 0 of iteration 0, in step order. DMA transfers issued before the
-        pipeline and not yet waited are waited before the first commit that
-        needs them, or at the end for jobs of later stages."""
-        sel = [it for it in items if it.stage == 0]
+    def prologue(self, p, blocks, var):
+        """The stage-0 blocks of iteration 0, in textual order. DMA transfers
+        issued before the pipeline and not yet waited are waited before the
+        first commit of a job that needs them, or at the end for the jobs of
+        later stages."""
         pending = [e for e in self.outer_pending(p) if e.kind == 'idma']
-        out = []
-        for g, o in self.emit(self.order(sel), var, lambda it: Const(0), lambda it: None):
-            if isinstance(o, ir.HwpeOp) and o.action.data in ('commit', 'commit_start'):
-                job = next(it for it in sel if it.proto == 'enqueue' and it.acc == o.acc.data)
-                names = {alloc_of(v).sym.data for v in job.op.bufs}
-                out += [wait(ir.EvtRef(e.kind, e.name, e.dir)) for e in pending if e.name in names]
-                pending = [e for e in pending if e.name not in names]
-            out.append(o)
+        out, enq = [], {}
+        for b in blocks:
+            if b.k != 0:
+                continue
+            for top in b.ops:
+                o = instantiate(top, var, Const(0))
+                for x in o.walk():
+                    if isinstance(x, ir.HwpeOp) and x.action.data == 'enqueue':
+                        enq[x.acc.data] = {alloc_of(v).sym.data for v in x.bufs}
+                if isinstance(o, ir.HwpeOp) and o.action.data in ('commit', 'commit_start'):
+                    names = enq.get(o.acc.data, set())
+                    out += [wait(ir.EvtRef(e.kind, e.name, e.dir)) for e in pending if e.name in names]
+                    pending = [e for e in pending if e.name not in names]
+                out.append(o)
         # operands of the jobs of later stages still in flight from before the pipeline
-        need = {alloc_of(v).sym.data for it in items
-                if (it.is_job and isinstance(it.op, ir.JobOp)) or it.proto == 'enqueue' for v in it.op.bufs}
+        need = {alloc_of(v).sym.data for b in blocks for top in b.ops for o in top.walk()
+                if isinstance(o, (ir.JobOp, ir.HwpeOp)) for v in o.bufs}
         out += [wait(ir.EvtRef(e.kind, e.name, e.dir)) for e in pending if e.name in need]
         if p.sync is not None:
             out.append(self.sync(p))
         return out
 
-    def step(self, items, var, step, n, S):
-        """Loop step: every stage's items for their iterations (stage k works on
-        step + 1 - k), in `order()`, each under its stage guard."""
-        seq = self.emit(self.order(items), var, lambda it: add(step, Const(1 - it.stage)),
-                        lambda it: self.guard(it.stage, S, step, n))
+    def step(self, blocks, var, step, n, S):
+        """Loop step: every block in textual order, on its iteration
+        step + 1 - k, under its stage guard."""
+        seq = [(self.guard(b.k, S, step, n), instantiate(top, var, add(step, Const(1 - b.k))))
+               for b in blocks for top in b.ops]
         guards = {g.c() for g, _ in seq if g is not None}
         if len(guards) <= 1:
             # one guard: the shape of the hand-written 2-stage tests
@@ -623,3 +685,13 @@ class Pipeline(ModulePass):
             grp.append(o)
         return out
 
+    @staticmethod
+    def schedule_doc(p, S, table):
+        """Block comment before the loop: stage/iteration mapping and the
+        stages and depth of each rotating storage."""
+        var = p.var.data
+        lines = [f'{p.kind.data}: {S} stages; step {var} runs stage k on iteration {var} + 1 - k']
+        w = max((len(name) for name, *_ in table), default=0)
+        for name, lo, hi, depth in table:
+            lines.append(f'  {name.ljust(w)}  stages {lo}..{hi}  depth {depth}')
+        return ir.CommentOp.create(attributes={'text': StringAttr('\n'.join(lines)), 'style': StringAttr('block')})

@@ -8,7 +8,9 @@
 * constant index `x[1]`          -> the slot's static address `l1_addr_x_1`
 * relative index `x[v + k]`      -> a rotating pointer (`x_pt`, `x_pt_next`,
   `x_pt_prev`, ...) selected once per value of `v` by an `mg.select`
-  (`if (v % 2)` / `switch (v % N)`).
+  (`if (v % 2)` / `switch (v % N)`). `k` is taken modulo the depth (slot
+  `v + k` is `(v + k) % N`), so deep pipelines may use e.g. `x[v - 2]` on a
+  depth-2 buffer: it is `x[v]`.
 
 The same applies to event arrays (`redmule_evt[i + 1]` -> `redmule_evt_next`).
 
@@ -31,7 +33,7 @@ from ..errors import MgcError
 from ..expr import Sym, const_of, sub
 from .common import alloc_of, ancestors, child_in
 
-ORDER = [0, -1, 1, -2, 2, -3, 3]
+ORDER = [0] + [k for m in range(1, 16) for k in (-m, m)]  # preferred offset for each slot
 
 
 def ptr_name(kind, name, k):
@@ -59,8 +61,8 @@ class MultiBuffer(ModulePass):
     `x[1]` becomes the fixed address `l1_addr_x_1`. `x[pt]` and `x[pt + 1]`
     become the pointers `x_pt` / `x_pt_next`, which an inserted `mg.select`
     (`if (pt % 2) {...} else {...}` or `switch (pt % N)`) points at the right
-    slot each iteration. Indices that are not `var + constant` with |constant| <
-    depth are errors, as is `rotate(v)` with nothing indexed by `v`.
+    slot each iteration. Indices that are not `var + constant` are errors, as
+    is `rotate(v)` with nothing indexed by `v`.
     """
     name = 'multi-buffer'
 
@@ -81,8 +83,10 @@ class MultiBuffer(ModulePass):
                 raise MgcError(op, f'slot index `{idx.c()}` must be a constant or `var + constant`')
             var = next(iter(syms))
             off = const_of(sub(idx, Sym(var), fold=False))
-            if off is None or abs(off) >= depth:
-                raise MgcError(op, f'index must be `{var} + k` with |k| < {depth} (the depth of `{name}`)')
+            if off is None:
+                raise MgcError(op, f'index of `{name}` must be `{var} + k` with a constant k')
+            if abs(off) >= depth:
+                off = next(k for k in ORDER if (k - off) % depth == 0)
             uses.setdefault(var, []).append((op, kind, name, depth, off))
             return ptr_name(kind, name, off)
 

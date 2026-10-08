@@ -49,7 +49,7 @@ or the compiler; the unit tests fail if they are out of date.
 | `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
 | `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
 
-`*_explicit.mgc` files write the schedule by hand; the others use `pipeline()`. The hand-written
+`*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`. The hand-written
 references are `mm_os_mglib`, `mm_ws_mglib` and `mm_is_mglib`; the last two are mglib ports of
 `mm_ws_2` and `mm_is_2` with the same schedule.
 
@@ -62,7 +62,6 @@ for y_id, x_id in tiles():
     timeslots: u8 = 4
     t_size: u8 = M // timeslots
     t_start: u8 = y_id * 2
-    total_timeslots: u8 = (MESH_Y_TILES - 1) * 2 + timeslots + 1
 
     w = L1.single_buffer(W[tile_h, tile_w])
     x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
@@ -70,17 +69,27 @@ for y_id, x_id in tiles():
 
     for z in range(N_ITERATIONS):
         idma.load(w, W[tile_h, tile_w]).wait()
-        for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=GLOBAL):
-            if y_id == 0:
-                idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
-            idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
-            j = redmule.enqueue(x[pt], w, y[pt])          # y += x @ w
-            redmule.commit_start()
-            j.wait(lag=0)                                 # done within the step
-            if y_id == MESH_Y_TILES - 1:
-                idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
-            else:
-                idma.store(y.at_rel(1, 0)[pt], y[pt])          # same slot, tile below
+        for pt in systolic(timeslots, skew=t_start, sync=GLOBAL):
+            with stage(0):                                # load the blocks of timeslot pt
+                if y_id == 0:
+                    ey = idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
+                ex = idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
+            with stage(2):                                # pass the block on (or store it)
+                if y_id == MESH_Y_TILES - 1:
+                    es = idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
+                else:
+                    es = idma.store(y.at_rel(1, 0)[pt], y[pt])   # same slot, tile below
+            with stage(1):                                # y += x @ w
+                j = redmule.enqueue(x[pt], w, y[pt])
+                redmule.commit_start()
+            with stage(0):                                # end of the step: wait for all of it
+                if y_id == 0:
+                    ey.wait()
+                ex.wait()
+            with stage(2):
+                es.wait()
+            with stage(1):
+                j.wait()
 
     sync(COL)
     if y_id == MESH_Y_TILES - 1:
@@ -112,6 +121,7 @@ The body of the tile loop runs equally in each tile, in a variant of the SPMD (S
 |---|---|---|
 | `for y_id, x_id in tiles():` | spatial | tile coordinates from `hartid`, `l1_tile_base` |
 | `for v in pipeline(n, ...)` | temporal | software pipeline (see below) |
+| `for v in systolic(n, skew=..., sync=...)` | temporal | systolic pipeline, skewed across the mesh (see below) |
 | `for v in range(n)`, `range(a, b)` | temporal | regular `for` loop |
 | `for c in cores():` | spatial | reserved for future usage with the PULP cluster in each tile, compile error (for now) |
 
@@ -136,7 +146,7 @@ tile split, or an integer expression (which removes the dimension).
 |---|---|
 | `b = L1.single_buffer(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
 | `b = L1.single_buffer((d0, d1, ...), dtype)` | L1-only buffer: each `d` is a tile split (its per-tile size) or an integer expression, e.g. `L1.single_buffer((tile_h, tile_w), fp16)`. No L2 tensor is involved; transfers to/from L2 must be dense. `L1.multi_buffer((d0, ...), dtype, depth=N)` works the same way |
-| `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset with \|k\| < N, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. |
+| `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. Without `depth=`, a buffer used in a `pipeline()`/`systolic()` gets the depth its stages need (see [Depths](#depths)). |
 | `b.at_rel(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.at_rel(0, 1)` is the tile to the right, `b.at_rel(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `idma.store`, to push a local buffer to a neighbour: `idma.store(b.at_rel(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
 | `b.at(y, x)[k]` | As `b.at_rel`, but on the tile with **absolute** coordinates `(y, x)`, which can be any integer expressions, including run-time ones (e.g. `b.at(y_id, 0)`, the first tile of this row). The tile's L1 base is computed where the transfer is issued (`get_l1_base(GET_ID(y, x))`). |
 | `b.at(y, x)[i, j, ...]` | A **block** of single-slot buffer `b` on another tile (works with `at_rel`, `at`, `row`, `col`). Indices are as for L2 views (slices, or integers that drop the dimension), over `b`'s shape; there must be more than one index or a slice, otherwise it is a slot. Only the destination of `idma.store`, whose source can then be **any** local buffer or slot of the same shape and dtype: `idma.store(rs.at(y_id, 0)[x_id, :], r)` gathers `r` into row `x_id` of `rs` on the first tile of the row. The block's offset is computed with this tile's sizes, so tile splits in `b`'s shape must be the same on the receiving tile (e.g. a split along the axis shared by the two tiles). |
@@ -175,11 +185,10 @@ waiting on an event that was never issued.
 | Statement | Emitted |
 |---|---|
 | `j = redmule.gemm(x, w, y)` then `j.wait()` | `mg_redmule_gemm` (y += x @ w), `mg_redmule_wait` |
-| `ev = redmule.events(n)` | event array; index with `ev[c]` or `ev[v + k]` |
+| `ev = redmule.events(n)` | event array; index with `ev[c]` or `ev[v + k]`; `redmule.events()` inside a pipeline gets the size its stages need |
 | `redmule.enqueue(x, w, y, event=ev[k])` | `mg_redmule_gemm_enqueue` |
 | `redmule.commit()`, `start()`, `commit_start()` | `mg_redmule_gemm_commit`, `_start`, `_commit_start` |
 | `ev[k].wait()` | `mg_redmule_wait` |
-| `commit…(lag=k)`, `.wait(lag=k)` | inside `pipeline()` only: place the step `k` stages later (see below) |
 | `k(a, b, ...)` (an `l1_kernel`) | `c_fn(a, b, ..., params)`, a synchronous call on the CV32 core |
 | `sync(GLOBAL)`, `sync(ROW)`, `sync(COL)` | `fsync_sync_global/row/col` + `eu_fsync_wait` |
 | `rotate(v)` | places the multi-buffer slot selection for `v` here (optional) |
@@ -194,65 +203,177 @@ shapes: `name.shape[i]`, `name.size` (elements) or `name.bytes`. The C function 
 operand addresses, then the parameters, all as `uint32_t`, and must be provided by the test
 (e.g. `src/kernels.c`).
 
-### `pipeline(n, skew=None, steps=None, sync=None)`
+### `pipeline(n, sync=None)`
 
-The body describes one iteration `i`: transfers, jobs, CV32 kernel calls and HWPE protocol steps,
-with transfers and jobs optionally inside `if` statements that do not depend on `i`. The compiler:
+`for i in pipeline(n):` is a software pipeline over `n` iterations. Its body describes **one
+iteration `i`**, split into **stages** with `with stage(k):` blocks. Stage `k` of iteration `i`
+runs `k` steps after stage 0 of the same iteration, so while stage 1 computes iteration `i`,
+stage 0 already loads iteration `i + 1`. The stages are chosen by the programmer; mgc generates
+the prologue, the guards, the slot rotation and the loop, and checks the schedule.
 
-1. **Assigns stages.** An item is placed one stage after the latest earlier item that writes a
-   slot it reads; otherwise it is in stage 0. Examples: load (0) → kernel (1) → store (2).
-   HWPE protocol steps follow their own rules (below).
-2. **Checks depths.** Each multi-buffer must have at least as many slots as the number of stages
-   its slots are live across. Each HWPE can hold `queue_depth` jobs (2 for RedMulE), and each job
-   in flight needs its own event.
-3. **Generates the schedule.** A prologue runs stage 0 of iteration 0. In loop step `s`,
-   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. A step runs in four
-   phases:
-   1. transfers, enqueues and `redmule.gemm` one-shots are issued;
-   2. commits/starts follow, each after the waits of the DMAs it needs, so the HWPE computes
-      while the core is busy with the next phase;
-   3. CV32 kernel calls, each followed by the commits that consume its output;
-   4. the remaining waits, in issue order.
+```python
+for sikv in pipeline(n_kv):
+    with stage(0):                         # load K/V block sikv
+        ek = idma.load(kt[sikv], KT[:, sikv * B:(sikv + 1) * B])
+    with stage(1):                         # compute on it, one step later
+        ek.wait()
+        if sikv > 0:
+            rescale(o, o, m_prev)
+        redmule.gemm(q, kt[sikv], s[sikv]).wait()
+        ...
+```
 
-With `skew` and `steps`, the loop runs over `steps` global time steps. The tile is active when
-`0 <= t - skew <= last step`. `sync=SCOPE` adds a barrier after the prologue and at the end of
-every time step, active or not.
+| Argument | Meaning |
+|---|---|
+| `n` | number of iterations of the body (`i = 0 … n-1`), i.e. the trip count of the loop as written |
+| `sync=SCOPE` | `GLOBAL`, `ROW` or `COL`: a barrier after the prologue and at the end of every step |
+
+A stage block holds anything the tile body accepts: transfers and their `.wait()`, jobs and the
+HWPE protocol, L1 kernels, `if` (also on `i`), `for v in range(...)`, scalars and `sync()`. Its
+statements see `i` as their own iteration, whatever step they run in.
+
+#### Steps
+
+In loop step `s`, every block runs **in textual order** on its own iteration `s + 1 - k`, and is
+skipped unless `0 <= s + 1 - k < n`. The first step (stage 0 of iteration 0 only) is emitted
+before the loop as the **prologue**; the loop runs the remaining `n + S - 2` steps, where `S` is
+the number of stages. With `n = 4` and `S = 3` (load → gemm → store):
+
+| step `s` | stage 0: load | stage 1: gemm | stage 2: store |
+|---|---|---|---|
+| prologue | `i = 0` | – | – |
+| 0 | `i = 1` | `i = 0` | – |
+| 1 | `i = 2` | `i = 1` | `i = 0` |
+| 2 | `i = 3` | `i = 2` | `i = 1` |
+| 3 | – | `i = 3` | `i = 2` |
+| 4 | – | – | `i = 3` |
+
+A stage may have several blocks. Since blocks run in textual order, a second `stage(0)` block
+at the end of the body runs at the end of every step: issuing the loads of stage 0 first and
+waiting them last lets them overlap the work of the later stages in between (see
+`tests/magia/mesh/mm_os_l1k` and the systolic example above).
+
+#### After the loop: `LAST`
+
+After a `pipeline()` / `systolic()` loop, `b[LAST]` is the slot of its last iteration `n - 1`,
+e.g. a running result kept in a multi-buffer (`LAST - 1` etc. work as well). With a constant
+`n` it is a fixed slot; otherwise mgc declares `int i_last = n - 1;` after the loop and selects
+the slot with it (`switch (i_last % N)`). `LAST` refers to the most recent such loop and is an
+error before any.
+
+#### Depths
+
+A storage indexed `[i + c]`, a multi-buffer slot or an event-array entry, that is touched in
+stages `a..b` is in use by `b - a + 1` iterations at once, so it needs **depth ≥ b − a + 1**.
+A use of `[i + c]` in stage `k` touches the slot of iteration `i + c`, so it counts as its
+stage `k - c`: e.g. `m[i - 1]` read in stage 2 keeps `m`'s slot busy until stage 3. A
+transfer or job keeps its buffers and its event busy until the stage of its `.wait()`. In the
+load → gemm → store example, `y` is loaded in stage 0 and stored in stage 2: `depth=3`. A
+multi-buffer without `depth=` (or `redmule.events()` without a size) gets exactly that (at least
+2 for a buffer); an explicit depth that is too small is an error naming the stages. The
+generated C lists, before the loop, every rotating storage with its stages and depth.
+
+On `pipeline()`, all tiles run the same step, so the destination of a store to another tile
+(`b.at_rel(...)[i]`, `b.row[i]`) counts as a use of `b[i]` in the store's stage.
+
+A **single buffer** written inside the loop must be used in one stage only: otherwise, while a
+later stage still uses it for iteration `i`, stage 0 already writes it for iteration `i + 1`.
+Make it a multi-buffer indexed `[i]`, or keep the state carried across iterations (an
+accumulator, a running maximum) in one stage. Read-only buffers, and the operands of an HWPE
+job between its commit and its wait (the queue runs jobs in order), are exempt.
+
+#### Events and names
+
+A `.wait()` belongs to the transfer or job issued earlier **in the same iteration** on the same
+event, in the issuing stage or a later one; every transfer/job issued in the body is waited in
+it. An event waited in a later stage than the one that issued it is in flight for several
+iterations, so mgc gives it per-iteration storage: an event array indexed by `i`
+(`idma_evts_<buf>_in/_out`, `redmule_evts`), with the depth rule above. `mg_idma_wait` waits by
+transfer id, so several DMAs of the same direction may be pending.
+
+Scalars declared in a block (`s_start: u16 = i * B`) can only be used in that block: elsewhere
+they would hold the value of another iteration. Recompute them where needed.
 
 #### HWPE jobs
 
-A job is written as the steps of the HWPE protocol:
+A job is either a one-shot (`redmule.gemm(...)`, waited with `.wait()`), or the explicit HWPE
+protocol, whose steps may sit in different stages:
 
 ```python
-ev = redmule.events(2)
+ev = redmule.events()                              # 2, from the stages below
 for i in pipeline(timeslots):
-    idma.load(x[i], X[...])
-    idma.load(w[i], W[...])
-    redmule.enqueue(x[i], w[i], y, event=ev[i])   # program the job: addresses only
-    redmule.commit_start()                         # or commit() and start()
-    ev[i].wait()
+    with stage(0):
+        ex = idma.load(x[i], X[...])
+        ew = idma.load(w[i], W[...])
+        redmule.enqueue(x[i], w[i], y, event=ev[i])  # program the job while x, w load
+        ex.wait()
+        ew.wait()
+        redmule.commit_start()                     # or commit() and start()
+    with stage(1):
+        ev[i].wait()                               # job i ran while iteration i + 1 loaded
 ```
 
-| Step | Stage |
-|---|---|
-| `commit_start()` / `commit()` | the stage of its latest producer, placed after it in the step (after the DMA's wait, or after the CV32 call); one stage later if the producer is an asynchronous job, or if the operand is written by another tile (data from a neighbour is valid only after the barrier) |
-| `enqueue(...)` | same stage as its commit, issued together with the transfers so that programming overlaps the DMA |
-| `start()` | commit + `lag` |
-| `.wait()` | start (or `commit_start`) + `lag`, **default `lag=1`**: job `i` runs while iteration `i + 1` loads; the wait is the writer of the job's outputs for later items |
+`event=` may be omitted: a job waited in a later stage then gets per-iteration events. The
+compiler checks that every job is enqueued, committed, started and waited, in this order within
+the iteration. It then simulates the schedule: the hardware queue commits and starts jobs in
+enqueue order, so every `commit()`/`start()` must hit the job of its own iteration, and at most
+`queue_depth` jobs (2 for RedMulE) may be enqueued and not yet waited. Several jobs per
+accelerator are allowed.
 
-`lag=k` on `commit`/`commit_start`/`start`/`.wait()` moves the step `k` stages later. In the
-example, the step of iteration `i + 1` loads, enqueues and commits job `i + 1` behind job `i`,
-then waits for job `i`. `.wait(lag=0)` keeps the job inside its step, as the systolic WS/IS
-tests do. With load → job → store, the store follows the wait one stage later, so `y` needs
-depth 3. The compiler checks that each protocol is complete and in order. It also checks that
-there is at most one explicit job per accelerator per `pipeline()` body and that the job does
-not exceed the queue or the event array. `event=` may be omitted when only one job is in flight.
-`redmule.gemm(...)` remains available as a one-shot job, issued and waited within its step.
+#### `sync()` inside stages
+
+`sync()` statements inside the blocks of a `pipeline()` are kept where they are written. This is
+only valid if every tile of the scope runs the same steps, so the trip count `n` must not depend
+on the tile ids (checked).
+
+#### Code shape
 
 The control-flow shape of the generated C follows the hand-written tests, because GCC's output
-depends on it:
+depends on it: a step with a single guard uses `if (next) {...; wait} else {wait}`; otherwise
+consecutive statements with the same guard share one `if`.
 
-- 2-stage pipelines use `if (next) {...; wait} else {wait}`;
-- deeper pipelines use one guard per stage.
+### `systolic(n, skew=..., sync=SCOPE, time="t")`
+
+In a systolic schedule (e.g. weight-static GEMM, `tests/magia/mesh/mm_ws_mgc`), data flows from
+tile to tile, so a tile can only start once its neighbour has produced its first block: row
+`y_id` of the mesh starts a few steps after row `y_id - 1`. At the same time, barriers only work
+if **every tile calls them the same number of times**, including tiles that have not started yet
+or have already finished.
+
+`systolic()` takes the same stage blocks as `pipeline()` and wraps its steps in a global time
+loop:
+
+```c
+/* prologue (stage 0 of iteration 0, on every tile) */
+sync();
+for (int t = 0; t < max(skew + n) + S - 2; t++) {   // computed by mgc, same on all tiles
+    int i = t - skew;                    // this tile's delay, may differ per tile
+    if (i >= 0 && i <= n + S - 3) {      // S: number of stages
+        /* pipeline step i */
+    }
+    sync();                              // every tile, active or not
+}
+```
+
+| Argument | Meaning |
+|---|---|
+| `n` | number of iterations |
+| `skew` | delay, in steps, of this tile with respect to tile 0; usually a function of `y_id`/`x_id` (in `mm_ws`, `skew = 2 * y_id`: a block takes one step to compute and one to travel to the tile below) |
+| `sync=SCOPE` | the barrier ending every time step (required) |
+| `time="t"` | name of the time-loop variable |
+
+- The length of the time loop is computed by mgc: it must be the same on every tile and cover
+  the latest one, so it is `max(skew + n) + S - 2` over the mesh. mgc inlines the
+  scalars that depend on the tile ids (`t_start` → `y_id * 2`), requires the result to be affine
+  in `y_id`/`x_id` with constant coefficients, and takes the maximum at the corresponding mesh
+  corner. In `mm_ws` (`S = 3`) this gives `(MESH_Y_TILES - 1) * 2 + timeslots + 1`.
+- `sync()` cannot be used inside the stages: tiles run different iterations in the same step.
+- Stores to other tiles do not count for the depth of the destination, since the receiving
+  tile runs skewed; matching its schedule is up to `skew`.
+
+A tile is idle (only taking part in the barriers) for the first `skew` time steps and after its
+`n + S - 2` loop steps are done. The prologue is not delayed by `skew`: it runs on every tile
+before the time loop. A test has at most one `pipeline()` or `systolic()`.
 
 ### Comments
 
@@ -274,9 +395,11 @@ and the last stage prints C against mglib. Each pass can be inspected on its own
 common mistakes. In particular:
 - it **decides** tile sizes and borders, L1 addresses (identical on all tiles), L2 offsets,
   iDMA length/stride/repetition, 1-D vs 2-D transfer selection, buffer rotation, event variables,
-  HWPE job sequence, and the guarded stage schedule of `pipeline()`.
+  HWPE job sequence, the guarded step schedule of `pipeline()`/`systolic()` from the stages
+  you write, multi-buffer depths you leave out, and the length of the systolic time loop.
 - it **rejects** views that the iDMA cannot express, accelerator operands with the wrong shape,
-  pipelines deeper than their buffers, and events that are waited on without being issued
+  pipelines deeper than their buffers, single buffers overwritten by the next iteration, HWPE
+  queues committing the wrong job, and events that are waited on without being issued
   (or reused before the previous transfer/job on it was waited).
 
 ### Tiny example
@@ -326,8 +449,8 @@ The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-idma` turn
 transfer, while `X[tile_h, :]` is contiguous and stays 1-D. The GEMM dimensions come from the
 buffer shapes, and the `tile_h`/`tile_w` borders handle meshes that do not divide the problem.
 To see the intermediate steps, run `mgcc.py tiny.mgc --print-ir-after=frontend` (or any pass name).
-Larger schedules replace the straight-line body with `pipeline()` and multi-buffered
-buffers, as in the weight-static example above.
+Larger schedules replace the straight-line body with `pipeline()`/`systolic()` stages and
+multi-buffered buffers, as in the weight-static example above.
 
 ### Source map
 
@@ -354,7 +477,7 @@ IR conventions:
 | Pass | Job |
 |---|---|
 | `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
-| `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, HWPE protocol placement, depth/queue checks |
+| `pipeline` | `mg.pipeline` + `mg.stage` blocks → prologue and guarded step loop; depth inference/checks, per-iteration events, HWPE queue simulation |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
 | `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
@@ -413,13 +536,9 @@ Extending:
 
 ## Limitations
 
-- One `tiles()` loop and one `pipeline()` per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
-- One explicit HWPE job (enqueue / commit / wait) per accelerator per `pipeline()` body; HWPE
-  protocol steps cannot be inside `if`. DMA waits inside `pipeline()` are always placed by the
-  compiler.
+- One `tiles()` loop and one `pipeline()` or `systolic()` per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
 - fp16 only; RedMulE GEMM is the only HWPE accelerator described.
 - L1 kernels run only on the CV32 control core.
-- Comments inside a `pipeline()` body are dropped, except the leading docstring.
 - No L1 capacity check (tile sizes are run-time values).
 - The event check accepts code that is valid on at least one path, so it can miss errors that
   depend on correlated conditions.

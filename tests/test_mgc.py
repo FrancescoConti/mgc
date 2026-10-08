@@ -43,8 +43,9 @@ def _body(c):
 
 
 def _code(c):
-    # drop comments and blank lines (comments inside pipeline() bodies are not kept)
-    return '\n'.join(l for l in _body(c).splitlines() if l.strip() and not l.strip().startswith('//'))
+    # drop comments and blank lines
+    return '\n'.join(l for l in _body(c).splitlines()
+                     if l.strip() and not l.strip().startswith(('//', '/*', '* ', '*/')) and l.strip() != '*')
 
 
 def _clang_format():
@@ -152,7 +153,23 @@ class Systolic(unittest.TestCase):
         src = _read(WS, 'mm_ws.mgc').replace('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=2')
         with self.assertRaises(MgcError) as cm:
             _c(WS, 'x.mgc', src)
-        self.assertIn('live across 3 pipeline stages', str(cm.exception))
+        self.assertIn('used in stages 0..2, so it holds 3 iterations at once', str(cm.exception))
+
+    def test_time_steps_computed(self):
+        # max(skew + n) + S - 2 over the mesh, skew = t_start = y_id * 2 inlined
+        self.assertIn('for (int t = 0; t < (MESH_Y_TILES - 1) * 2 + timeslots + 1; t++) {', _c(WS, 'mm_ws.mgc'))
+        # a negative coefficient picks the other corner
+        src = _read(WS, 'mm_ws.mgc').replace('t_start: u8 = y_id * 2', 't_start: u8 = 6 - y_id * 2')
+        self.assertIn('t < 6 + timeslots + 1;', _c(WS, 'x.mgc', src))
+
+    def test_time_steps_checks(self):
+        src = _read(WS, 'mm_ws.mgc')
+        with self.assertRaisesRegex(MgcError, 'computed by mgc'):
+            _c(WS, 'x.mgc', src.replace('skew=t_start,', 'skew=t_start, steps=9,'))
+        with self.assertRaisesRegex(MgcError, 'affine in y_id'):
+            _c(WS, 'x.mgc', src.replace('t_start: u8 = y_id * 2', 't_start: u8 = y_id * y_id'))
+        with self.assertRaisesRegex(MgcError, 'depends on tile_h'):
+            _c(WS, 'x.mgc', src.replace('skew=t_start', 'skew=tile_h.size'))
 
 
 class Kernels(unittest.TestCase):
@@ -170,13 +187,6 @@ class Kernels(unittest.TestCase):
         order = ['mg_redmule_gemm_enqueue', 'l1_copy_fp16(x_pt', 'mg_redmule_gemm_commit_start',
                  '&idma_evt_w);', 'redmule_evt_prev);']
         self.assertEqual(order, sorted(order, key=loop.index))
-
-    def test_independent_commit_before_kernel(self):
-        # a job that does not read the kernel's output is started before the CV32 call
-        src = _read(L1K, 'mm_os_l1k.mgc').replace('redmule.enqueue(x[i], w[i], y,', 'redmule.enqueue(x_raw[i], w[i], y,')
-        c = _c(L1K, 'x.mgc', src)
-        loop = c[c.index('for (int i = 0'):]
-        self.assertLess(loop.index('mg_redmule_gemm_commit_start'), loop.index('l1_copy_fp16(x_pt'))
 
     def test_kernel_operand_count(self):
         src = _read(L1K, 'mm_os_l1k.mgc').replace('copy(x[i], x_raw[i])', 'copy(x[i])')
@@ -233,12 +243,8 @@ class Extensibility(unittest.TestCase):
                                                         ('a.shape[1]', 'b.shape[1]')))},
             fn={'oneshot': 'mg_neureka_{job}', 'wait': 'mg_neureka_wait'})
         hw = dict(devices.HWPES, neureka=acc)
-        # an asynchronous producer moves the RedMulE commit one stage later: w, x and the
-        # RedMulE events live across one more stage
-        src = _read(L1K, 'mm_os_l1k.mgc').replace('copy(x[i], x_raw[i])', 'neureka.scale(x_raw[i], x[i])').replace(
-            'W[0:t_size, tile_w], depth=3', 'W[0:t_size, tile_w], depth=4').replace(
-            'x = L1.multi_buffer(X[tile_h, 0:t_size], depth=2)', 'x = L1.multi_buffer(X[tile_h, 0:t_size], depth=3)').replace(
-            'redmule.events(2)', 'redmule.events(3)')
+        # the new accelerator replaces the CV32 copy, as a one-shot job waited in its stage
+        src = _read(L1K, 'mm_os_l1k.mgc').replace('copy(x[i], x_raw[i])', 'neureka.scale(x_raw[i], x[i]).wait()')
         with mock.patch.dict(devices.HWPES, hw):
             c = _c(L1K, 'x.mgc', src)
             self.assertIn('mg_neureka_scale(&neureka_ctrl,', c)
@@ -293,7 +299,7 @@ class Errors(unittest.TestCase):
                          'never issued')
 
     def test_bad_slot_offset(self):
-        self.assertError('ex = idma.load(x[i + 1],', 'ex = idma.load(x[i + 3],', '|k| < 2')
+        self.assertError('ex = idma.load(x[i + 1],', 'ex = idma.load(x[i * 2],', 'must be `i + k`')
 
     def test_after_is_gone(self):
         self.assertError('job = redmule.gemm(x[pt], w, y[pt])', 'job = redmule.gemm(x[pt], w, y[pt], after=(ex,))',
@@ -529,8 +535,8 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class Protocol(unittest.TestCase):
-    """Explicit HWPE protocol (enqueue / commit_start / wait) inside pipeline()."""
+class Stages(unittest.TestCase):
+    """Explicit `with stage(k):` blocks: schedule, depths, events, HWPE protocol, checks."""
 
     SRC = '''from mgc import *
 
@@ -539,7 +545,7 @@ X = l2("x_inp", (M, N), fp16)
 W = l2("w_inp", (N, K), fp16)
 Y = l2("y_inp", (M, K), fp16)
 
-@test("test_proto")
+@test("test_stages")
 def main():
     for y_id, x_id in tiles():
         tile_w = x_id.split(K)
@@ -551,12 +557,18 @@ def main():
         ev = redmule.events(2)
         idma.load(w, W[:, tile_w]).wait()
         for i in pipeline(steps):
-            idma.load(x[i], X[i * t_size:(i + 1) * t_size, :])
-            idma.load(y[i], Y[i * t_size:(i + 1) * t_size, tile_w])
-            redmule.enqueue(x[i], w, y[i], event=ev[i])
-            redmule.commit_start()
-            ev[i].wait()
-            idma.store(Y[i * t_size:(i + 1) * t_size, tile_w], y[i])
+            with stage(0):
+                ex = idma.load(x[i], X[i * t_size:(i + 1) * t_size, :])
+                ey = idma.load(y[i], Y[i * t_size:(i + 1) * t_size, tile_w])
+                redmule.enqueue(x[i], w, y[i], event=ev[i])
+                ex.wait()
+                ey.wait()
+                redmule.commit_start()
+            with stage(1):
+                ev[i].wait()
+            with stage(2):
+                es = idma.store(Y[i * t_size:(i + 1) * t_size, tile_w], y[i])
+                es.wait()
 '''
 
     def c(self, *pairs):
@@ -574,55 +586,147 @@ def main():
         self.assertIn(msg, str(cm.exception))
 
     def test_three_stages(self):
-        # loads + commit stage 0, wait stage 1, store stage 2
         c = self.c()
         self.assertIn('for (int i = 0; i < steps + 1; i++) {', c)
         store = c.index('l2_addr_y + ((i - 1)')
         self.assertEqual(c[c.rfind('if (', 0, store):].split('\n')[0], 'if (i > 0) {')
         self.assertIn('mg_redmule_wait(&eu_ctrl, WAIT_MODE, ev_curr);', c)
+        self.assertIn('y   stages 0..2  depth 3', c)
 
-    def test_wait_counts_as_writer_for_depth(self):
-        self.assertError('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=2', 'live across 3 pipeline stages')
-
-    def test_lag_delays_commit(self):
-        c = self.c(('redmule.commit_start()', 'redmule.commit_start(lag=1)'), ('ev[i].wait()', 'ev[i].wait(lag=0)'))
+    def test_block_order_is_step_order(self):
+        # a second stage-0 block runs at the end of the step, after the stage-2 store
+        c = self.c(('                ex.wait()\n                ey.wait()\n                redmule.commit_start()\n', ''),
+                   ('                es.wait()\n', '                es.wait()\n            with stage(0):\n'
+                    '                ex.wait()\n                ey.wait()\n                redmule.commit_start()\n'))
         loop = c[c.index('for (int i = 0'):]
-        # the commit moves to the step after the loads: no DMA wait in front of it
-        self.assertLess(loop.index('mg_redmule_gemm_commit_start'), loop.index('&idma_evt_x);'))
+        order = ['mg_redmule_gemm_enqueue', 'redmule_wait', 'l2_addr_y + ((i - 1)', '&idma_evt_x);',
+                 'mg_redmule_gemm_commit_start']
+        self.assertEqual(order, sorted(order, key=loop.index))
 
-    def test_queue_depth(self):
-        self.assertError('ev[i].wait()', 'ev[i].wait(lag=2)', 'redmule holds 2 jobs, but 3 would be in flight')
-
-    def test_event_array_depth(self):
+    def test_depth_rule(self):
+        self.assertError('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=2',
+                         'used in stages 0..2, so it holds 3 iterations at once')
         self.assertError('ev = redmule.events(2)', 'ev = redmule.events(1)', 'with redmule.events(2) or more')
 
-    def test_default_event_single_job_only(self):
-        self.assertError([('redmule.enqueue(x[i], w, y[i], event=ev[i])', 'j = redmule.enqueue(x[i], w, y[i])'),
-                          ('ev[i].wait()', 'j.wait()')], 'pass `event=ev[i]`')
+    def test_depth_inferred(self):
+        c = self.c(('X[0:t_size, :], depth=2', 'X[0:t_size, :]'), ('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w]'),
+                   ('redmule.events(2)', 'redmule.events()'))
+        self.assertIn('switch (i % 3) {', c)
+        self.assertIn('mg_event_t ev_0, ev_1;', c)
+        for line in ('x   stages 0..1  depth 2', 'y   stages 0..2  depth 3', 'ev  stages 0..1  depth 2'):
+            self.assertIn(line, c)
 
-    def test_commit_needs_enqueue(self):
-        self.assertError('redmule.enqueue(x[i], w, y[i], event=ev[i])', 'pass', 'needs an earlier redmule.enqueue()')
+    def test_depth_slot_offset(self):
+        # y[i - 1] in stage 2 is iteration i - 1's slot, i.e. its stage 3
+        self.assertError('Y[i * t_size:(i + 1) * t_size, tile_w], y[i])', 'Y[i * t_size:(i + 1) * t_size, tile_w], y[i - 1])',
+                         'used in stages 0..3, so it holds 4 iterations at once')
 
-    def test_wait_needed(self):
-        self.assertError('ev[i].wait()', 'pass', 'needs a .wait()')
+    def test_inferred_depth_needs_a_pipeline(self):
+        self.assertError('ev = redmule.events(2)', 'ev = redmule.events(2)\n        z = L1.multi_buffer(X[0:t_size, :])',
+                         '`z` is not used by a pipeline()')
+
+    def test_last_slot_after_the_loop(self):
+        # constant trip count: LAST = steps - 1 = 3 is fixed slot 3 % 3 = 0
+        store = '        idma.store(Y[0:t_size, tile_w], y[LAST]).wait()\n'
+        c = _c(OS, 'x.mgc', self.SRC + store)
+        self.assertIn('l1_addr_y_0,', c[c.rindex('l2_addr_y,'):])
+        # run-time trip count: `i_last` picks the slot, pointers are still declared before the loop
+        c = _c(OS, 'x.mgc', (self.SRC + store).replace('pipeline(steps)', 'pipeline(t_size - x_id)'))
+        self.assertIn('int i_last = t_size - x_id - 1;', c)
+        self.assertLess(c.index('volatile uint32_t y_pt;'), c.index('for (int i = 0'))
+        self.assertLess(c.index('int i_last'), c.index('switch (i_last % 3) {'))
+
+    def test_last_outside_a_pipeline(self):
+        self.assertError('        for i in pipeline(steps):', '        idma.store(Y[0:t_size, tile_w], y[LAST]).wait()\n'
+                         '        for i in pipeline(steps):', 'use it after the loop')
+
+    def test_if_on_loop_variable(self):
+        c = self.c(('                es = idma.store(', '                if i > 0:\n                    es = idma.store('))
+        self.assertIn('if ((i - 1) > 0) {', c)
+
+    def test_wrapped_slot_offsets(self):
+        # z lives in stages 2..3: in step i, stage 3 works on iteration i - 2, slot z[i - 2] = z[i]
+        c = self.c(('ev = redmule.events(2)', 'ev = redmule.events(2)\n        z = L1.multi_buffer(X[0:t_size, :], depth=2)'),
+                   ('                es.wait()\n', '                es.wait()\n'
+                    '                idma.load(z[i], X[i * t_size:(i + 1) * t_size, :]).wait()\n'
+                    '            with stage(3):\n                idma.store(X[i * t_size:(i + 1) * t_size, :], z[i]).wait()\n'))
+        loop = c[c.index('for (int i = 0'):]
+        self.assertIn('z_pt_prev,', loop)
+        self.assertIn('z_pt,', loop)
+
+    def test_cross_stage_dma_event(self):
+        # a store waited one stage later gets per-iteration events
+        c = self.c(('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=4'),
+                   ('                es.wait()\n', '            with stage(3):\n                es.wait()\n'))
+        self.assertIn('mg_event_t idma_evts_y_out_0, idma_evts_y_out_1;', c)
+        self.assertIn('mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, idma_evts_y_out_curr);', c)
+        self.assertIn('idma_evts_y_out  stages 2..3  depth 2', c)
+
+    def test_cross_stage_default_job_event(self):
+        c = self.c(('redmule.enqueue(x[i], w, y[i], event=ev[i])', 'j = redmule.enqueue(x[i], w, y[i])'),
+                   ('ev[i].wait()', 'j.wait()'))
+        self.assertIn('mg_event_t redmule_evts_0, redmule_evts_1;', c)
+        self.assertIn('mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evts_curr);', c)
+
+    def test_wait_before_issue(self):
+        self.assertError([('                redmule.enqueue(', '                ev[i].wait()\n                redmule.enqueue('),
+                          ('            with stage(1):\n                ev[i].wait()\n', '')],
+                         'has no transfer or job issued before it')
+
+    def test_never_waited(self):
+        self.assertError('                es.wait()\n', '', 'never waited')
 
     def test_start_needs_commit(self):
         self.assertError('redmule.commit_start()', 'redmule.start()', 'needs an earlier redmule.commit()')
 
-    def test_one_job_per_accelerator(self):
-        self.assertError('redmule.commit_start()', 'redmule.enqueue(x[i], w, y[i], event=ev[i])', 'one redmule job')
+    def test_queue_depth(self):
+        self.assertError([('redmule.events(2)', 'redmule.events(3)'),
+                          ('            with stage(1):\n                ev[i].wait()\n',
+                           '            with stage(2):\n                ev[i].wait()\n')],
+                         'redmule holds 2 jobs, but 3 would be in flight')
 
-    def test_no_mixing_with_gemm(self):
-        self.assertError('ev[i].wait()', 'ev[i].wait()\n            redmule.gemm(x[i], w, y[i])', 'driven explicitly')
+    def test_two_jobs_on_one_accelerator(self):
+        c = self.c(('                ev[i].wait()\n', '                ev[i].wait()\n'
+                    '                redmule.gemm(x[i], w, y[i]).wait()\n'))
+        loop = c[c.index('for (int i = 0'):]
+        order = ['mg_redmule_gemm_commit_start', 'ev_curr);', 'mg_redmule_gemm(', '&redmule_evt);']
+        self.assertEqual(order, sorted(order, key=loop.index))
 
-    def test_no_lag_on_enqueue(self):
-        self.assertError('event=ev[i])', 'event=ev[i], lag=1)', 'not accepted on enqueue')
+    def test_lag_removed(self):
+        self.assertError('redmule.commit_start()', 'redmule.commit_start(lag=1)', '`lag=` was removed')
 
-    def test_lag_only_in_pipeline(self):
-        with self.assertRaises(MgcError) as cm:
-            _c(OS, 'x.mgc', _read(OS, 'mm_os_explicit.mgc').replace('redmule.commit_start()', 'redmule.commit_start(lag=1)', 1))
-        self.assertIn('only meaningful inside pipeline()', str(cm.exception))
+    def test_single_buffer_written_across_stages(self):
+        self.assertError('                es.wait()\n', '                es.wait()\n'
+                         '                idma.load(w, W[:, tile_w]).wait()\n', 'written in the loop and used in stages 0, 2')
 
-    def test_dma_waits_are_implicit(self):
-        self.assertError('idma.load(x[i], X[i * t_size:(i + 1) * t_size, :])',
-                         'idma.load(x[i], X[i * t_size:(i + 1) * t_size, :]).wait()', 'placed automatically')
+    def test_scalar_across_stages(self):
+        self.assertError([('                ex = idma.load(', '                r: u16 = i * t_size\n                ex = idma.load('),
+                          ('Y[i * t_size:(i + 1) * t_size, tile_w], y[i])', 'Y[r:r + t_size, tile_w], y[i])')],
+                         '`r` is declared in a stage(0) block and used in another block')
+
+    def test_sync_in_stage(self):
+        c = self.c(('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'))
+        self.assertIn('fsync_sync_row(&fsync_ctrl);', c)
+        self.assertError([('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'),
+                          ('pipeline(steps)', 'pipeline(tile_w.size)')], 'same on every tile')
+
+    def test_sync_not_in_systolic(self):
+        src = _read(WS, 'mm_ws.mgc').replace('                    j.wait()\n', '                    j.wait()\n                    sync(COL)\n')
+        with self.assertRaisesRegex(MgcError, r'no sync\(\) inside systolic\(\)'):
+            _c(WS, 'x.mgc', src)
+
+    def test_skew_is_systolic(self):
+        src = _read(WS, 'mm_ws.mgc').replace('systolic(timeslots', 'pipeline(timeslots')
+        with self.assertRaisesRegex(MgcError, 'pipeline\\(\\) has no `skew`'):
+            _c(WS, 'x.mgc', src)
+
+    def test_body_is_stages(self):
+        self.assertError('            with stage(1):\n', '            idma.load(w, W[:, tile_w]).wait()\n            with stage(1):\n',
+                         'made of `with stage(k):` blocks')
+        self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
+                         '        with stage(0):\n            idma.load(w, W[:, tile_w]).wait()\n', 'go directly in the body')
+
+    def test_one_loop_per_test(self):
+        body = self.SRC[self.SRC.index('        for i in pipeline'):]
+        self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
+                         '        idma.load(w, W[:, tile_w]).wait()\n' + body, 'only one pipeline() or systolic()')

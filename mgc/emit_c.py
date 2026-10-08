@@ -323,7 +323,7 @@ class Emitter:
     def wait(self, op):
         """Print the wait matching the event: `mg_idma_wait(...)` or `mg_redmule_wait(...)`."""
         e = op.event.data
-        if e.kind == 'idma':
+        if e.kind == 'idma' or (e.kind == 'array' and self.evkinds[e.name] == 'idma'):
             self.w.line(f'mg_idma_wait(&eu_ctrl, {e.dir}, {WAIT_MODE}, {e.cname});')
         else:
             acc = e.name if e.kind == 'hwpe' else self.evkinds[e.name]
@@ -467,6 +467,8 @@ class Emitter:
         ops = list(self.tiles.body.block.ops)
         cut = 0
         for k, op in enumerate(ops):
+            if isinstance(op, ir.ForOp):
+                break  # declarations go before the first loop (e.g. not after a pipeline's `i_last`)
             if isinstance(op, DECLARATIVE) or (isinstance(op, ir.ScalarOp) and op.decl.data):
                 cut = k + 1
         self.block(ops[:cut])

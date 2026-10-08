@@ -306,7 +306,6 @@ class Frontend:
         }
         self.module_ops = []
         self.blocks: List[Block] = []
-        self.in_pipeline = False
 
     # -- building ------------------------------------------------------------
     def add(self, op, node=None):
@@ -510,6 +509,8 @@ class Frontend:
         if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
             return Const(n.value)
         if isinstance(n, ast.Name):
+            if n.id == 'LAST' and n.id not in self.env:
+                raise MgcError(n, '`LAST` is the last iteration of a pipeline() or systolic(): use it after the loop')
             if n.id not in self.env:
                 raise MgcError(n, f'undefined name `{n.id}`')
             v = self.env[n.id]
@@ -703,6 +704,8 @@ class Frontend:
         elif isinstance(s, ast.If):
             self.add(ir.IfOp.create(attributes={'cond': ir.E(self.cond(s.test))},
                                     regions=[self.region(s.body), self.region(s.orelse)]), s)
+        elif isinstance(s, ast.With):
+            raise MgcError(s, '`with stage(k):` blocks go directly in the body of pipeline() or systolic()')
         elif isinstance(s, ast.Continue):
             self.add(ir.ContinueOp.create(), s)
         elif isinstance(s, ast.Pass):
@@ -748,7 +751,8 @@ class Frontend:
 
         - `y_id.split(E)` -> tile split (`mg.split`);
         - `L1.single_buffer(view | (d0, ...), dtype)` / `L1.multi_buffer(..., depth=N)` -> L1 buffer (`alloc()`);
-        - `redmule.events(n)` -> event array (`mg.events`);
+        - `redmule.events(n)` -> event array (`mg.events`); `redmule.events()` lets
+          pipeline() choose `n`;
         - `idma.load/store(...)`, `redmule.gemm(...)`, `kernel(...)` -> the name is
           bound to the returned event, so `e.wait()` works later;
         - anything else -> integer scalar (`scalar()`).
@@ -770,9 +774,9 @@ class Frontend:
         elif (on, fn) in (('L1', 'single_buffer'), ('L1', 'multi_buffer')):
             self.alloc(s, name, fn)
         elif fn == 'events' and on in devices.HWPES:
-            n = const_of(self.expr(s.value.args[0])) if s.value.args else None
-            if not n or n < 1:
-                raise MgcError(s, f'{on}.events(n) takes a constant depth >= 1')
+            n = const_of(self.expr(s.value.args[0])) if s.value.args else 0  # 0: inferred by pipeline()
+            if n is None or (s.value.args and n < 1):
+                raise MgcError(s, f'{on}.events(n) takes a constant depth >= 1 (or none, inferred by pipeline())')
             ea = EvArray(name, n, on)
             self.env[name] = ea
             self.add(ir.EventsOp.create(attributes={'sym': StringAttr(name), 'depth': IntAttr(n),
@@ -785,14 +789,15 @@ class Frontend:
             self.scalar(s, tgt, s.value, None)
 
     def alloc(self, s, name, kind):
-        """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
+        """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`;
+        without `depth=`, the multi-buffer gets the depth its pipeline() needs.
 
         The view argument only provides the buffer's shape (and transfer
         geometry); no data moves. Alternatively, `L1.single_buffer((d0, d1), fp16)`
         gives the shape directly (each `d` a tile split or an integer expression)
         for an L1-only buffer with no L2 tensor behind it. Emits `mg.alloc` and
         binds `name` to a `Buf` with `depth` slots (1 for `single_buffer`, >= 2
-        for `multi_buffer`).
+        for `multi_buffer`, 0 if left to pipeline()).
         """
         args = s.value.args
         if args and isinstance(args[0], ast.Tuple):
@@ -809,14 +814,14 @@ class Frontend:
             if not isinstance(view, ir.View):
                 raise MgcError(s, f'L1.{kind}() takes an L2 tensor view or a shape tuple and a dtype')
             dtype = self.env[view.tensor].dtype
-        depth = 1
+        depth = 1 if kind == 'single_buffer' else 0  # 0: inferred by pipeline()
         for kw in s.value.keywords:
             if kw.arg == 'depth' and kind == 'multi_buffer':
                 depth = const_of(self.expr(kw.value))
+                if depth is None or depth < 2:
+                    raise MgcError(s, 'L1.multi_buffer(..., depth=N) needs a constant N >= 2')
             else:
                 raise MgcError(s, f'unknown argument {kw.arg}')
-        if kind == 'multi_buffer' and (depth is None or depth < 2):
-            raise MgcError(s, 'L1.multi_buffer() needs a constant depth >= 2')
         if not view.shape:
             raise MgcError(s, 'cannot allocate a scalar')
         op = self.add(ir.AllocOp.create(attributes={'sym': StringAttr(name), 'view': ir.ViewAttr(view),
@@ -859,13 +864,8 @@ class Frontend:
             ev = self.action(obj, s) if isinstance(obj, ast.Call) else self.ev(obj)
             if not isinstance(ev, ir.EvtRef):
                 raise MgcError(c, '.wait() applies to events of DMA transfers and accelerator jobs')
-            attrs = {'event': ir.EvtAttr(ev)}
-            lag = self._lag(c)
-            if lag is not None:
-                if ev.kind == 'idma':
-                    raise MgcError(c, '`lag=` applies to accelerator jobs: DMA waits are placed by pipeline()')
-                attrs['lag'] = IntAttr(lag)
-            self.add(ir.WaitOp.create(attributes=attrs), s)
+            self._no_args(c)
+            self.add(ir.WaitOp.create(attributes={'event': ir.EvtAttr(ev)}), s)
             return None
         if on == 'dma':
             raise MgcError(c, '`dma` was renamed `idma`: use `idma.load` / `idma.store`')
@@ -992,23 +992,15 @@ class Frontend:
             raise MgcError(c, f'unknown arguments: {", ".join(kw)}')
         return ev or ir.EvtRef('hwpe', acc)
 
-    def _lag(self, c):
-        """The `lag=k` argument of a protocol step (`redmule.commit_start(lag=1)`,
-        `ev[i].wait(lag=0)`), or None; only valid inside `pipeline()`."""
-        kw = {k.arg: k.value for k in c.keywords}
-        if set(kw) - {'lag'} or c.args:
-            raise MgcError(c, f'{ast.unparse(c.func)}() takes only `lag=`')
-        if 'lag' not in kw:
-            return None
-        if not self.in_pipeline:
-            raise MgcError(c, '`lag=` is only meaningful inside pipeline()')
-        try:
-            lag = ast.literal_eval(kw['lag'])
-        except ValueError:
-            lag = None
-        if not isinstance(lag, int) or lag < 0:
-            raise MgcError(c, '`lag=` must be a non-negative integer constant')
-        return lag
+    @staticmethod
+    def _no_args(c):
+        """Protocol steps and waits take no arguments (`lag=` was removed: the
+        stage a statement runs in is the `with stage(k):` block holding it)."""
+        if any(k.arg == 'lag' for k in c.keywords):
+            raise MgcError(c, '`lag=` was removed: put the statement in the `with stage(k):` block '
+                              'where it should run')
+        if c.args or c.keywords:
+            raise MgcError(c, f'{ast.unparse(c.func)}() takes no arguments')
 
     def hwpe(self, c, acc, fn, s):
         """Accelerator calls on `acc` (e.g. `redmule`):
@@ -1016,22 +1008,16 @@ class Frontend:
         - `redmule.gemm(x, w, y)` (a job named in `devices.HWPES`): one-shot job,
           computes `y += x @ w`; returns its event;
         - `redmule.enqueue(x, w, y, event=ev[k])`: program a job without starting it;
-        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control
-          (inside `pipeline()`, with an optional `lag=k`).
+        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control.
         """
         dev = devices.HWPES[acc]
         if fn in ('commit', 'start', 'commit_start'):
             job = next(iter(dev.jobs))
-            attrs = {'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr(fn),
-                     'slots': ArrayAttr([])}
-            lag = self._lag(c)
-            if lag is not None:
-                attrs['lag'] = IntAttr(lag)
-            self.add(ir.HwpeOp.create(attributes=attrs), s)
+            self._no_args(c)
+            self.add(ir.HwpeOp.create(attributes={'acc': StringAttr(acc), 'job': StringAttr(job),
+                                                  'action': StringAttr(fn), 'slots': ArrayAttr([])}), s)
             return None
         if fn == 'enqueue':
-            if any(k.arg == 'lag' for k in c.keywords):
-                raise MgcError(c, '`lag=` is not accepted on enqueue: pipeline() issues it with its commit')
             job = next(iter(dev.jobs))
             ev = self._event_kw(c, acc)
             bufs, slots = self._job_operands(c, s)
@@ -1083,10 +1069,16 @@ class Frontend:
         """Time loops inside the tile loop.
 
         - `for i in range(n)` / `range(a, b)` -> plain loop (`mg.for`);
-        - `for pt in pipeline(n, skew=S, steps=T, sync=SCOPE)` -> software
-          pipeline over `n` iterations (`mg.pipeline`); `skew` and `steps` must
-          be given together (this tile starts `S` steps late out of `T` total),
-          `sync` adds a barrier per step, `time` is a label.
+        - `for i in pipeline(n, sync=SCOPE)` -> software pipeline over `n`
+          iterations (`mg.pipeline`, kind 'pipeline'); `sync` adds a barrier
+          per step;
+        - `for pt in systolic(n, skew=S, sync=SCOPE, time="t")` -> systolic
+          pipeline: this tile starts `S` steps late in a time loop shared by the
+          mesh (its length is computed by the pipeline pass), with a barrier per
+          step; `time` names the time-loop variable.
+
+        The body of `pipeline()` / `systolic()` is made of `with stage(k):`
+        blocks (see `stages()`).
 
         The loop variable is only in scope inside the body. `tiles()` and
         `cores()` are rejected here.
@@ -1096,8 +1088,9 @@ class Frontend:
             raise MgcError(s, 'tiles() (level 1, spatial) must be the outermost loop of main')
         if fn == 'cores':
             raise MgcError(s, 'cores() is reserved (level 3, intra-tile parallelism) and not implemented yet')
-        if fn not in ('range', 'pipeline') or not isinstance(s.target, ast.Name) or s.orelse:
-            raise MgcError(s, 'time loops are `for v in range(n)` or `for v in pipeline(n)`')
+        if fn not in ('range', 'pipeline', 'systolic') or not isinstance(s.target, ast.Name) or s.orelse:
+            raise MgcError(s, 'time loops are `for v in range(n)`, `for v in pipeline(n)` or '
+                              '`for v in systolic(n, skew=...)`')
         var = s.target.id
         args = s.iter.args
         saved = self.env.get(var)
@@ -1115,36 +1108,78 @@ class Frontend:
                                  regions=[self.region(s.body, enter=enter)])
         else:
             if len(args) != 1:
-                raise MgcError(s, 'pipeline(n, ...) takes one trip count')
-            attrs = {'var': StringAttr(var), 'n': ir.E(self.expr(args[0]))}
+                raise MgcError(s, f'{fn}(n, ...) takes one trip count')
+            attrs = {'kind': StringAttr(fn), 'var': StringAttr(var), 'n': ir.E(self.expr(args[0]))}
             for kw in s.iter.keywords:
-                if kw.arg in ('skew', 'steps'):
+                if kw.arg == 'skew' and fn == 'systolic':
                     attrs[kw.arg] = ir.E(self.expr(kw.value))
+                elif kw.arg == 'skew':
+                    raise MgcError(s, 'pipeline() has no `skew`: a skewed schedule is `systolic(n, skew=..., sync=...)`')
                 elif kw.arg == 'sync':
                     sc = _name(kw.value)
                     if sc not in devices.SYNC:
                         raise MgcError(s, f'sync scope must be one of {", ".join(devices.SYNC)}')
                     attrs['sync'] = StringAttr(sc)
-                elif kw.arg == 'time':
+                elif kw.arg == 'time' and fn == 'systolic':
                     attrs['time'] = StringAttr(ast.literal_eval(kw.value))
+                elif kw.arg == 'steps':
+                    raise MgcError(s, f'{fn}(): `steps=` is computed by mgc from `skew` and `n`; remove it')
                 else:
-                    raise MgcError(s, f'unknown pipeline() argument {kw.arg}')
-            if ('skew' in attrs) != ('steps' in attrs):
-                raise MgcError(s, 'pipeline(): `skew=` needs `steps=` (total time steps of the mesh)')
+                    raise MgcError(s, f'unknown {fn}() argument {kw.arg}')
+            if fn == 'systolic' and ('skew' not in attrs or 'sync' not in attrs):
+                raise MgcError(s, 'systolic(n, skew=..., sync=SCOPE) needs both `skew` and `sync`')
 
             def enter():
                 self.env[var] = Sym(var, None, 'int')
 
-            self.in_pipeline = True
-            try:
-                op = ir.PipelineOp.create(attributes=attrs, regions=[self.region(s.body, enter=enter)])
-            finally:
-                self.in_pipeline = False
+            op = ir.PipelineOp.create(attributes=attrs, regions=[self.stages(s, fn, enter)])
         self.add(op, s)
         if saved is None:
             self.env.pop(var, None)
         else:
             self.env[var] = saved
+        if fn != 'range':
+            # LAST: the last iteration, n - 1, to pick its slots after the loop (`row_sum[LAST]`)
+            last = sub(attrs['n'].data, Const(1))
+            if last.value() is not None:
+                last = Const(last.value())
+            else:
+                lname = f'{var}_last'
+                self.add(ir.ScalarOp.create(attributes={'sym': StringAttr(lname), 'ctype': StringAttr('int'),
+                                                        'value': ir.E(last), 'decl': IntAttr(1)}), s)
+                last = Sym(lname, None, 'int')
+            self.env['LAST'] = last
+
+
+    def stages(self, s, fn, enter):
+        """The body of `pipeline()` / `systolic()`: `with stage(k):` blocks (k a
+        constant >= 0), in the order they run within a step; a stage may have
+        several blocks. Docstrings and comments are kept; anything else is an
+        error. Returns the region of `mg.stage` ops."""
+        blk = Block()
+        self.blocks.append(blk)
+        enter()
+        for st in s.body:
+            if not isinstance(st, ast.With):
+                self.flush_comments(st)  # comments above a stage block go into it
+            if _is_doc(st):
+                self.stmt(st)
+                continue
+            if isinstance(st, ast.Pass):
+                continue
+            item = st.items[0] if isinstance(st, ast.With) and len(st.items) == 1 else None
+            call = item.context_expr if item is not None and item.optional_vars is None else None
+            if _call_parts(call) != (None, 'stage') or len(call.args) != 1 or call.keywords:
+                raise MgcError(st, f'the body of {fn}() is made of `with stage(k):` blocks')
+            k = const_of(self.expr(call.args[0]))
+            if k is None or k < 0:
+                raise MgcError(st, 'stage(k) takes a constant k >= 0')
+            self.add(ir.StageOp.create(attributes={'k': IntAttr(k)}, regions=[self.region(st.body)]), st)
+            self.cursor = max(self.cursor, getattr(st, 'end_lineno', 0) or 0)
+        self.blocks.pop()
+        if not any(isinstance(o, ir.StageOp) for o in blk.ops):
+            raise MgcError(s, f'empty {fn}() body: write its statements in `with stage(k):` blocks')
+        return Region(blk)
 
 
 def parse(src, filename, header=None) -> ModuleOp:
