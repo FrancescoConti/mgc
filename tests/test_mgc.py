@@ -96,7 +96,7 @@ class Equivalence(unittest.TestCase):
                  'mg_redmule_gemm_commit_start', 'redmule_evt_curr);']
         self.assertEqual(order, sorted(order, key=loop.index))
         # the hand-written shape: the current-job wait is in both branches
-        self.assertEqual(loop.count('mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_curr);'), 2)
+        self.assertEqual(loop.count('mg_redmule_wait(WAIT_MODE, redmule_evt_curr);'), 2)
         self.assertNotIn('mg_redmule_gemm_start(', c)
         self.assertNotIn('mg_redmule_gemm_commit(', c)
 
@@ -118,8 +118,8 @@ class Systolic(unittest.TestCase):
         # after the barrier), and waited in the same step (lag=0)
         enq = c.index('mg_redmule_gemm_enqueue')
         self.assertEqual(c[c.rfind('if (', 0, enq):].split('\n')[0], 'if (pt < timeslots) {')
-        self.assertLess(c.index('mg_redmule_gemm_commit_start'), c.index('mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);'))
-        self.assertEqual(c.count('fsync_sync_global(&fsync_ctrl);'), 2)  # prologue + every step
+        self.assertLess(c.index('mg_redmule_gemm_commit_start'), c.index('mg_redmule_wait(WAIT_MODE, &redmule_evt);'))
+        self.assertEqual(c.count('fsync_sync_global();'), 2)  # prologue + every step
 
     def test_remote_store_and_uniform_layout(self):
         c = _c(WS, 'mm_ws.mgc')
@@ -133,7 +133,7 @@ class Systolic(unittest.TestCase):
     def test_is_east_and_row_barrier(self):
         c = _c(IS, 'mm_is.mgc')
         self.assertIn('uint32_t l1_base_e = get_l1_base(hartid + 1);', c)
-        self.assertIn('fsync_sync_row(&fsync_ctrl);', c)
+        self.assertIn('fsync_sync_row();', c)
         self.assertNotIn('fsync_sync_global', c)
 
     def test_event_storage_split_only_when_overlapping(self):
@@ -236,7 +236,7 @@ class Extensibility(unittest.TestCase):
 
     def test_new_hwpe_is_a_descriptor(self):
         acc = devices.Hwpe(
-            name='neureka', ctrl='&neureka_ctrl', queue_depth=2,
+            name='neureka', queue_depth=2,
             jobs={'scale': devices.HwpeJob(operands=(('a', 'in', 2), ('b', 'out', 2)),
                                            params=(('uint32_t', 'a.size'),),
                                            constraints=(('a.shape[0]', 'b.shape[0]'),
@@ -247,9 +247,9 @@ class Extensibility(unittest.TestCase):
         src = _read(L1K, 'mm_os_l1k.mgc').replace('copy(x[i], x_raw[i])', 'neureka.scale(x_raw[i], x[i]).wait()')
         with mock.patch.dict(devices.HWPES, hw):
             c = _c(L1K, 'x.mgc', src)
-            self.assertIn('mg_neureka_scale(&neureka_ctrl,', c)
+            self.assertIn('mg_neureka_scale(WAIT_MODE,', c)
             self.assertIn('(uint32_t)(tile_h * t_size)', c)
-            self.assertIn('mg_neureka_wait(&eu_ctrl, WAIT_MODE, &neureka_evt);', c)
+            self.assertIn('mg_neureka_wait(WAIT_MODE, &neureka_evt);', c)
             bad = src.replace('neureka.scale(x_raw[i], x[i])', 'neureka.scale(x_raw[i], w[i])')
             with self.assertRaises(MgcError) as cm:
                 _c(L1K, 'x.mgc', bad)
@@ -365,7 +365,7 @@ def main():
         self.assertIn('if (mcast_w != y_id) {', c)
         self.assertIn('get_l1_base(GET_ID(mcast_w, x_id)) + (l1_addr_w - l1_tile_base),', c)
         # one wait covers all the unicasts (same-direction transfers complete in order)
-        self.assertEqual(c.count('mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_x);'), 1)
+        self.assertEqual(c.count('mg_idma_wait(1, WAIT_MODE, &idma_evt_x);'), 1)
         self.assertIn('l1_addr_w = l1_addr_x + (tile_h_max * N_SIZE * 2);', c)  # uniform layout
 
     def test_native_multicast_is_a_table_change(self):
@@ -590,7 +590,7 @@ def main():
         self.assertIn('for (int i = 0; i < steps + 1; i++) {', c)
         store = c.index('l2_addr_y + ((i - 1)')
         self.assertEqual(c[c.rfind('if (', 0, store):].split('\n')[0], 'if (i > 0) {')
-        self.assertIn('mg_redmule_wait(&eu_ctrl, WAIT_MODE, ev_curr);', c)
+        self.assertIn('mg_redmule_wait(WAIT_MODE, ev_curr);', c)
         self.assertIn('y   stages 0..2  depth 3', c)
 
     def test_block_order_is_step_order(self):
@@ -659,14 +659,14 @@ def main():
         c = self.c(('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=4'),
                    ('                es.wait()\n', '            with stage(3):\n                es.wait()\n'))
         self.assertIn('mg_event_t idma_evts_y_out_0, idma_evts_y_out_1;', c)
-        self.assertIn('mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, idma_evts_y_out_curr);', c)
+        self.assertIn('mg_idma_wait(1, WAIT_MODE, idma_evts_y_out_curr);', c)
         self.assertIn('idma_evts_y_out  stages 2..3  depth 2', c)
 
     def test_cross_stage_default_job_event(self):
         c = self.c(('redmule.enqueue(x[i], w, y[i], event=ev[i])', 'j = redmule.enqueue(x[i], w, y[i])'),
                    ('ev[i].wait()', 'j.wait()'))
         self.assertIn('mg_event_t redmule_evts_0, redmule_evts_1;', c)
-        self.assertIn('mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evts_curr);', c)
+        self.assertIn('mg_redmule_wait(WAIT_MODE, redmule_evts_curr);', c)
 
     def test_wait_before_issue(self):
         self.assertError([('                redmule.enqueue(', '                ev[i].wait()\n                redmule.enqueue('),
@@ -706,7 +706,7 @@ def main():
 
     def test_sync_in_stage(self):
         c = self.c(('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'))
-        self.assertIn('fsync_sync_row(&fsync_ctrl);', c)
+        self.assertIn('fsync_sync_row();', c)
         self.assertError([('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'),
                           ('pipeline(steps)', 'pipeline(tile_w.size)')], 'same on every tile')
 
@@ -730,3 +730,56 @@ def main():
         body = self.SRC[self.SRC.index('        for i in pipeline'):]
         self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
                          '        idma.load(w, W[:, tile_w]).wait()\n' + body, 'only one pipeline() or systolic()')
+
+
+class JobEvents(unittest.TestCase):
+    """Jobs of different stages on the default event, in flight together in one step."""
+
+    SRC = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)
+
+@test("test_job_events")
+def main():
+    for y_id, x_id in tiles():
+        tile_w = x_id.split(K)
+        steps: u8 = 4
+        t_size: u8 = M // steps
+        w = L1.single_buffer(W[:, tile_w])
+        x = L1.multi_buffer(X[0:t_size, :])
+        y = L1.multi_buffer(Y[0:t_size, tile_w])
+        z = L1.single_buffer(Y[0:t_size, tile_w])
+        idma.load(w, W[:, tile_w]).wait()
+        for i in pipeline(steps):
+            with stage(0):
+                idma.load(x[i], X[i * t_size:(i + 1) * t_size, :]).wait()
+            with stage(2):
+                jz = redmule.enqueue(x[i], w, z)
+                redmule.commit_start()
+            with stage(1):
+                jy = redmule.enqueue(x[i], w, y[i])
+                redmule.commit_start()
+            with stage(2):
+                jz.wait()
+            with stage(1):
+                jy.wait()
+'''
+
+    def test_overlapping_jobs_get_own_events(self):
+        c = _c(OS, 'x.mgc', self.SRC)
+        self.assertIn('mg_event_t redmule_evt_z;', c)
+        self.assertIn('mg_event_t redmule_evt_y;', c)
+        self.assertIn('mg_redmule_wait(WAIT_MODE, &redmule_evt_z);', c)
+        self.assertNotIn('&redmule_evt)', c)
+
+    def test_disjoint_jobs_share_the_event(self):
+        src = self.SRC.replace('                redmule.commit_start()\n            with stage(1):',
+                               '                redmule.commit_start()\n                jz.wait()\n'
+                               '            with stage(1):', 1)
+        src = src.replace('            with stage(2):\n                jz.wait()\n', '')
+        c = _c(OS, 'x.mgc', src)
+        self.assertIn('mg_event_t redmule_evt;', c)
+        self.assertNotIn('redmule_evt_', c)

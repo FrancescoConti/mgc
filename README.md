@@ -291,6 +291,10 @@ iterations, so mgc gives it per-iteration storage: an event array indexed by `i`
 (`idma_evts_<buf>_in/_out`, `redmule_evts`), with the depth rule above. `mg_idma_wait` waits by
 transfer id, so several DMAs of the same direction may be pending.
 
+Jobs of different stages without `event=` can be in flight together in one step even if they
+are not in one iteration. mgc then gives each its own event, named after its output buffer
+(`redmule_evt_<buf>`, or `redmule_<buf>_evts` if waited in a later stage).
+
 Scalars declared in a block (`s_start: u16 = i * B`) can only be used in that block: elsewhere
 they would hold the value of another iteration. Recompute them where needed.
 
@@ -438,10 +442,9 @@ uint32_t reps_w    = (uint32_t)N_SIZE;           // number of rows
 uint32_t l1_addr_w = l1_addr_x + (tile_h * N_SIZE * 2);   // L1 layout: x, then w, then y
 uint32_t l2_addr_w = (uint32_t)w_inp + (tile_w_max * x_id * 2);
 ...
-mg_idma_memcpy_2d(&idma_ctrl, &eu_ctrl, WAIT_MODE, 0,
-                  l2_addr_w, l1_addr_w, len_w, std_w, reps_w, &idma_evt_w, NULL);
+mg_idma_memcpy_2d(WAIT_MODE, 0, l2_addr_w, l1_addr_w, len_w, std_w, reps_w, &idma_evt_w, NULL);
 ...
-mg_redmule_gemm(&redmule_ctrl, &eu_ctrl, WAIT_MODE, l1_addr_x, l1_addr_w, l1_addr_y,
+mg_redmule_gemm(WAIT_MODE, l1_addr_x, l1_addr_w, l1_addr_y,
                 (uint16_t)tile_h, (uint16_t)N_SIZE, (uint16_t)tile_w, &redmule_evt, NULL);
 ```
 

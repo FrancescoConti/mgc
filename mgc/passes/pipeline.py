@@ -96,7 +96,8 @@ def _subst_attr(a, m):
                                    list(v.kept)))
     if isinstance(a, ir.EvtAttr):
         e = a.data
-        return ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index.subst(m) if e.index is not None else None))
+        return ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index.subst(m) if e.index is not None else None,
+                                    job=e.job))
     if isinstance(a, ArrayAttr):
         return ArrayAttr([_subst_attr(x, m) for x in a.data])
     return a
@@ -207,7 +208,7 @@ def _evkey(e: ir.EvtRef, var):
     """Identity of the storage an event names, within one iteration."""
     if e.kind == 'array':
         return ('array', e.name, None, _slot(e.index, var))
-    return (e.kind, e.name, e.dir, None)
+    return (e.kind, e.name, e.dir, e.job)
 
 
 def _issues(op):
@@ -292,6 +293,7 @@ class Pipeline(ModulePass):
         self.check_syncs(p, uses, systolic)
         self.check_scalars(blocks)
         issues = self.match_events(uses, var)
+        self.split_job_events(issues, var, kdefs)
         self.check_hwpe(uses, issues, blocks, var)
         self.cross_stage_events(module, p, issues, var)
         table = self.depths(module, uses, issues, var, kdefs, remote=not systolic)
@@ -389,6 +391,46 @@ class Pipeline(ModulePass):
             raise MgcError(its[0].use.op, f'this transfer/job (stage {its[0].use.k}) is never waited in the loop body')
         return issues
 
+    @staticmethod
+    def split_job_events(issues, var, kdefs):
+        """Jobs on an accelerator's default event, issued in different stages,
+        can be in flight together in one step even if they are not in one
+        iteration: give each its own event, named after its output buffer
+        (`redmule_evt_o`). Only when their lifetimes in the step overlap."""
+        def span(it):
+            if it.last != it.use.k:
+                return None  # in flight across steps
+            w = max(it.waits, key=lambda w: w.order)
+            return (it.use.block.pos, it.use.order[2]), (w.block.pos, w.order[2])
+
+        def overlap(a, b):
+            if a.use.k == b.use.k:
+                return False  # same order as in the iteration
+            sa, sb = span(a), span(b)
+            return sa is None or sb is None or (sa[0] < sb[1] and sb[0] < sa[1])
+
+        groups = {}
+        for it in issues:
+            if it.key[0] == 'hwpe':
+                groups.setdefault(it.key, []).append(it)
+        for its in groups.values():
+            split = [a for a in its if any(overlap(a, b) for b in its if b is not a)]
+            waits = [id(w.op) for it in split for w in it.waits]
+            if not split or len(waits) != len(set(waits)):
+                continue  # a wait shared by several jobs keeps the common event
+            used = set()
+            for it in split:
+                outs = [a.sym.data for a, _, written in _buffers(it.use.op, var, kdefs, False) if written]
+                base = outs[0] if outs else 'job'
+                tag, n = base, 1
+                while tag in used:
+                    tag, n = f'{base}{n}', n + 1
+                used.add(tag)
+                for u in [it.use] + it.waits:
+                    e = u.op.event.data
+                    u.op.attributes['event'] = ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index, job=tag))
+                it.key = _evkey(u.op.event.data, var)
+
     def check_hwpe(self, uses, issues, blocks, var):
         """Protocol of every explicit job (enqueue -> commit [-> start] -> wait,
         in iteration order), then one simulated run of the schedule: the in-order
@@ -483,11 +525,11 @@ class Pipeline(ModulePass):
                 cross[it.key] = None
         arrays = []
         for key in cross:
-            kind, name, d, _ = key
+            kind, name, d, job = key
             if kind == 'idma':
                 arr, ekind = f'idma_evts_{name}_{"out" if d else "in"}', 'idma'
             else:
-                arr, ekind = f'{name}_evts', name
+                arr, ekind = f'{name}_{job}_evts' if job else f'{name}_evts', name
             cross[key] = arr
             arrays.append(ir.EventsOp.create(attributes={'sym': StringAttr(arr), 'depth': IntAttr(0),
                                                          'kind': StringAttr(ekind)}))

@@ -173,8 +173,8 @@ class Emitter:
         elif isinstance(op, ir.WaitOp):
             self.wait(op)
         elif isinstance(op, ir.SyncOp):
-            w.line(f'{devices.SYNC[op.scope.data]}(&fsync_ctrl);')
-            w.line(f'eu_fsync_wait(&eu_ctrl, {WAIT_MODE});')
+            w.line(f'{devices.SYNC[op.scope.data]}();')
+            w.line(f'eu_fsync_wait({WAIT_MODE});')
         elif isinstance(op, ir.SelectOp):
             self.select(op)
         elif isinstance(op, ir.CheckOp):
@@ -249,7 +249,7 @@ class Emitter:
 
     def idma(self, op):
         """Print an iDMA call, e.g.
-        `mg_idma_memcpy_2d(&idma_ctrl, &eu_ctrl, WAIT_MODE, 0, axi, obi, len_x, std_x, reps_x, &evt, NULL);`
+        `mg_idma_memcpy_2d(WAIT_MODE, 0, axi, obi, len_x, std_x, reps_x, &evt, NULL);`
         For remote stores the L2 (AXI) side is the other tile's L1 address: a
         neighbour base (`l1_base_s`), `get_l1_base(GET_ID(y, x))` for absolute
         tile ids, or the native multicast function for `row`/`col` targets
@@ -292,23 +292,23 @@ class Emitter:
         if op.obi is not None and not is_zero(op.obi.data):
             # a block of the local buffer
             obi += f' + ({op.obi.data.c()})'
-        args = ['&idma_ctrl', '&eu_ctrl', WAIT_MODE, str(op.dir.data), axi, obi] + geo
+        args = [WAIT_MODE, str(op.dir.data), axi, obi] + geo
         args += [op.event.data.cname, 'NULL']
         self.w.blank()
         self.w.call(fn, args)
 
     def hwpe(self, op):
-        """Print one accelerator protocol step: `mg_redmule_gemm_commit(ctrl);` or
+        """Print one accelerator protocol step: `mg_redmule_gemm_commit();` or
         a job call with buffer addresses, `(uint16_t)` shape parameters and event."""
         dev = devices.HWPES[op.acc.data]
         act = op.action.data
         fn = dev.fn[act].format(job=op.job.data)
         if act in ('commit', 'start', 'commit_start'):
-            self.w.line(f'{fn}({dev.ctrl});')
+            self.w.line(f'{fn}();')
             return
         spec = dev.jobs[op.job.data]
         params = [f'({t}){_paren(p.data)}' for (t, _), p in zip(spec.params, op.params.data)]
-        args = [dev.ctrl, '&eu_ctrl', WAIT_MODE] + [a.data for a in op.addrs.data] + params
+        args = [WAIT_MODE] + [a.data for a in op.addrs.data] + params
         args += [op.event.data.cname, 'NULL']
         self.w.blank()
         self.w.call(fn, args)
@@ -324,10 +324,10 @@ class Emitter:
         """Print the wait matching the event: `mg_idma_wait(...)` or `mg_redmule_wait(...)`."""
         e = op.event.data
         if e.kind == 'idma' or (e.kind == 'array' and self.evkinds[e.name] == 'idma'):
-            self.w.line(f'mg_idma_wait(&eu_ctrl, {e.dir}, {WAIT_MODE}, {e.cname});')
+            self.w.line(f'mg_idma_wait({e.dir}, {WAIT_MODE}, {e.cname});')
         else:
             acc = e.name if e.kind == 'hwpe' else self.evkinds[e.name]
-            self.w.line(f'{devices.HWPES[acc].fn["wait"]}(&eu_ctrl, {WAIT_MODE}, {e.cname});')
+            self.w.line(f'{devices.HWPES[acc].fn["wait"]}({WAIT_MODE}, {e.cname});')
 
     def select(self, op):
         """Print the multi-buffer slot selection: assigns each rotating pointer
@@ -535,32 +535,12 @@ PROLOGUE = '''/**
  */
 uint32_t hartid = get_hartid();
 
-idma_config_t idma_cfg = {{.hartid = hartid}};
-idma_controller_t idma_ctrl = {{
-    .base = NULL,
-    .cfg  = &idma_cfg,
-    .api  = &idma_api,
-}};
+idma_init();
+redmule_init();
 
-redmule_config_t redmule_cfg = {{.hartid = hartid}};
-redmule_controller_t redmule_ctrl = {{
-    .base = NULL,
-    .cfg  = &redmule_cfg,
-    .api  = &redmule_api,
-}};
-
-idma_init(&idma_ctrl);
-redmule_init(&redmule_ctrl);
-
-eu_config_t eu_cfg = {{.hartid = hartid}};
-eu_controller_t eu_ctrl = {{
-    .base = NULL,
-    .cfg  = &eu_cfg,
-    .api  = &eu_api,
-}};
-eu_init(&eu_ctrl);
-eu_redmule_init(&eu_ctrl, 0);
-eu_idma_init(&eu_ctrl, 0);
+eu_init();
+eu_redmule_init(0);
+eu_idma_init(0);
 
 uint32_t {y} = GET_Y_ID(hartid);
 uint32_t {x} = GET_X_ID(hartid);
@@ -573,41 +553,14 @@ PROLOGUE_SYNC = '''/**
  */
 uint32_t hartid = get_hartid();
 
-idma_config_t idma_cfg = {{.hartid = hartid}};
-idma_controller_t idma_ctrl = {{
-    .base = NULL,
-    .cfg  = &idma_cfg,
-    .api  = &idma_api,
-}};
+fsync_init();
+idma_init();
+redmule_init();
 
-redmule_config_t redmule_cfg = {{.hartid = hartid}};
-redmule_controller_t redmule_ctrl = {{
-    .base = NULL,
-    .cfg  = &redmule_cfg,
-    .api  = &redmule_api,
-}};
-
-fsync_config_t fsync_cfg = {{.hartid = hartid}};
-fsync_controller_t fsync_ctrl = {{
-    .base = NULL,
-    .cfg  = &fsync_cfg,
-    .api  = &fsync_api,
-}};
-
-fsync_init(&fsync_ctrl);
-idma_init(&idma_ctrl);
-redmule_init(&redmule_ctrl);
-
-eu_config_t eu_cfg = {{.hartid = hartid}};
-eu_controller_t eu_ctrl = {{
-    .base = NULL,
-    .cfg  = &eu_cfg,
-    .api  = &eu_api,
-}};
-eu_init(&eu_ctrl);
-eu_redmule_init(&eu_ctrl, 0);
-eu_idma_init(&eu_ctrl, 0);
-eu_fsync_init(&eu_ctrl, 0);
+eu_init();
+eu_redmule_init(0);
+eu_idma_init(0);
+eu_fsync_init(0);
 
 uint32_t {y} = GET_Y_ID(hartid);
 uint32_t {x} = GET_X_ID(hartid);

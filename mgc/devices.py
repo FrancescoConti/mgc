@@ -67,16 +67,14 @@ class HwpeJob:
 class Hwpe:
     """Description of a memory-mapped accelerator (HWPE) on the tile.
 
-    `name` is the name used in `.mgc` (`redmule.gemm(...)`), `ctrl` the C
-    controller variable passed to mglib, `queue_depth` how many jobs the hardware
-    can hold at once (2 for RedMulE: one running, one queued), `jobs` the
+    `name` is the name used in `.mgc` (`redmule.gemm(...)`), `queue_depth` how
+    many jobs the hardware can hold at once (2 for RedMulE: one running, one queued), `jobs` the
     supported jobs by name, and `fn` the mglib function used for each protocol
     step (`enqueue`, `oneshot`, `commit`, `start`, `commit_start`, `wait`),
     where `{job}` expands to the job name (`mg_redmule_{job}_enqueue` ->
     `mg_redmule_gemm_enqueue`).
     """
     name: str
-    ctrl: str  # controller variable in the test
     queue_depth: int  # hardware job queue
     jobs: Dict[str, HwpeJob]
     fn: Dict[str, str] = field(default_factory=dict)  # action -> mglib function ({job} expands)
@@ -85,7 +83,6 @@ class Hwpe:
 HWPES: Dict[str, Hwpe] = {
     'redmule':
     Hwpe(name='redmule',
-         ctrl='&redmule_ctrl',
          queue_depth=2,
          jobs={
              # y += x @ w

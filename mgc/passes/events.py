@@ -6,7 +6,8 @@
 """event-alloc: event storage names + use check.
 
 Storage: one `mg_event_t` per (buffer, direction) for DMA, one per
-accelerator for un-pipelined jobs, event arrays as declared. The two
+accelerator for un-pipelined jobs (one per job if pipeline() puts several
+in flight at once), event arrays as declared. The two
 directions of a buffer share `idma_evt_<buf>` unless they can be in flight at
 the same time (then `idma_evt_<buf>_in` / `_out`).
 
@@ -73,13 +74,13 @@ class _Analysis:
             syms = idx.syms()
             var = next(iter(syms)) if len(syms) == 1 else None
             return ('arr', e.name, var, const_of(sub(idx, Sym(var), fold=False)) if var else idx.c())
-        return (e.kind, e.name, e.dir)
+        return (e.kind, e.name, e.dir, e.job)
 
     def note(self, st):
         """Record buffers whose load and store events are pending at once."""
         bufs = {k[1] for k, v in st.items() if k[0] == 'idma' and v != N}
         for b in bufs:
-            if st.get(('idma', b, 0), N) != N and st.get(('idma', b, 1), N) != N:
+            if st.get(('idma', b, 0, None), N) != N and st.get(('idma', b, 1, None), N) != N:
                 self.overlap.add(b)
 
     def issue(self, op, st, e):
@@ -180,7 +181,7 @@ class EventAlloc(ModulePass):
                     base += '_in' if e.dir == 0 else '_out'
                 return '&' + base
             if e.kind == 'hwpe':
-                name = f'{e.name}_evt'
+                name = f'{e.name}_evt' + (f'_{e.job}' if e.job else '')
                 return '&' + (name + '_job' if name in evarrays else name)
             return e.cname
 
@@ -188,4 +189,4 @@ class EventAlloc(ModulePass):
             ev = op.attributes.get('event')
             if isinstance(ev, ir.EvtAttr):
                 e = ev.data
-                op.attributes['event'] = ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index, cname(e)))
+                op.attributes['event'] = ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index, cname(e), e.job))

@@ -86,12 +86,15 @@ class EvtRef:
     dir: Optional[int] = None  # idma only
     index: Optional[Expr] = None  # array only
     cname: Optional[str] = None  # resolved C pointer expression (event-alloc / multi-buffer)
+    job: Optional[str] = None  # hwpe only: own storage for a job in flight with another one
 
     def key(self):
-        return (self.kind, self.name, self.dir)
+        return (self.kind, self.name, self.dir, self.job)
 
     def __str__(self):
         s = f'{self.kind}:{self.name}'
+        if self.job is not None:
+            s += f'.{self.job}'
         if self.dir is not None:
             s += f'/{self.dir}'
         if self.index is not None:
