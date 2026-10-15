@@ -6,7 +6,7 @@
 # Francesco Conti <f.conti@unibo.it>
 """mgcc - compile an mgc ("magic") test description into mglib C.
 
-    mgcc.py tests/magia/mesh/mm_os_mgc/mm_os.mgc -o tests/magia/mesh/mm_os_mgc/src/test.c
+    mgcc.py tests/magia/mgc/mm_os_mgc/mm_os.mgc -o tests/magia/mgc/mm_os_mgc/src/test.c
     mgcc.py mm_os.mgc --print-ir-after=pipeline     # inspect the IR after a pass
     mgcc.py mm_os.mgc --print-ir-after-all
 

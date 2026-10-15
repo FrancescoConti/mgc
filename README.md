@@ -18,8 +18,8 @@ python3 -m venv mgc/.venv
 mgc/.venv/bin/pip install -r mgc/requirements.txt
 
 # compile (the header defaults to include/test.h next to the source)
-mgc/.venv/bin/python mgc/mgcc.py tests/magia/mesh/mm_os_mgc/mm_os.mgc \
-    -o tests/magia/mesh/mm_os_mgc/src/test.c
+mgc/.venv/bin/python mgc/mgcc.py tests/magia/mgc/mm_os_mgc/mm_os.mgc \
+    -o tests/magia/mgc/mm_os_mgc/src/test.c
 
 # build and run as any other test
 make build tiles=2 test=test_mm_os_mgc
@@ -44,12 +44,12 @@ or the compiler; the unit tests fail if they are out of date.
 
 | Directory | Source | Content |
 |---|---|---|
-| `tests/magia/mesh/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
-| `tests/magia/mesh/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
-| `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
-| `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
-| `tests/magia/mesh/mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
-| `tests/magia/mesh/mgc_unfused_attn` | `mgc_unfused_attn.mgc`, `src/kernels.c` | unfused attention: three named pipelines in a row (Q @ Kt on RedMulE, row softmax on Spatz, attn @ V on RedMulE), each step's buffers pinned to its loop so that the steps share L1 |
+| `tests/magia/mgc/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
+| `tests/magia/mgc/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
+| `tests/magia/mgc/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
+| `tests/magia/mgc/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
+| `tests/magia/mgc/mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
+| `tests/magia/mgc/unfused_attn` | `unfused_attn.mgc`, `src/kernels.c` | unfused attention: three named pipelines in a row (Q @ Kt on RedMulE, row softmax on Spatz, attn @ V on RedMulE), each step's buffers pinned to its loop so that the steps share L1 |
 
 `*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`. The hand-written
 references are `mm_os_mglib`, `mm_ws_mglib` and `mm_is_mglib`; the last two are mglib ports of
@@ -257,7 +257,7 @@ the number of stages. With `n = 4` and `S = 3` (load → gemm → store):
 A stage may have several blocks. Since blocks run in textual order, a second `stage(0)` block
 at the end of the body runs at the end of every step: issuing the loads of stage 0 first and
 waiting them last lets them overlap the work of the later stages in between (see
-`tests/magia/mesh/mm_os_l1k` and the systolic example above).
+`tests/magia/mgc/mm_os_l1k` and the systolic example above).
 
 #### After the loop: `LAST`
 
@@ -282,7 +282,7 @@ By default every L1 buffer has its own address range for the whole test, so the 
 sum of all the buffers, even of loops that never run at the same time. A buffer **pinned** to a
 loop shares L1 with the buffers pinned to the other loops: the L1 used becomes the unpinned
 buffers plus the largest loop. Name the loop with `name=` and pin the buffer with `pin=`
-(from `tests/magia/mesh/mgc_unfused_attn`):
+(from `tests/magia/mgc/unfused_attn`):
 
 ```python
 a  = L1.single_buffer(attn_[tile_h, tile_w], pin="qk")     # step 1 only
@@ -411,7 +411,7 @@ consecutive statements with the same guard share one `if`.
 
 ### `systolic(n, skew=..., sync=SCOPE, time="t")`
 
-In a systolic schedule (e.g. weight-static GEMM, `tests/magia/mesh/mm_ws_mgc`), data flows from
+In a systolic schedule (e.g. weight-static GEMM, `tests/magia/mgc/mm_ws_mgc`), data flows from
 tile to tile, so a tile can only start once its neighbour has produced its first block: row
 `y_id` of the mesh starts a few steps after row `y_id - 1`. At the same time, barriers only work
 if **every tile calls them the same number of times**, including tiles that have not started yet
