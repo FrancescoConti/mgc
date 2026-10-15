@@ -299,7 +299,9 @@ class Emitter:
 
     def hwpe(self, op):
         """Print one accelerator protocol step: `mg_redmule_gemm_commit();` or
-        a job call with buffer addresses, `(uint16_t)` shape parameters and event."""
+        a job call with buffer addresses, `(uint16_t)` shape parameters and event.
+        A job with an alternative (uninit-acc) is printed as `if (alt_if)` the
+        alternative call, else the job call."""
         dev = devices.HWPES[op.acc.data]
         act = op.action.data
         fn = dev.fn[act].format(job=op.job.data)
@@ -311,7 +313,20 @@ class Emitter:
         args = [WAIT_MODE] + [a.data for a in op.addrs.data] + params
         args += [op.event.data.cname, 'NULL']
         self.w.blank()
-        self.w.call(fn, args)
+        if op.alt is None:
+            self.w.call(fn, args)
+            return
+        alt = dev.fn[act].format(job=op.alt.data)
+        w = self.w
+        w.line(f'if ({op.alt_if.data.c()}) {{')
+        w.ind += 1
+        w.call(alt, args)
+        w.ind -= 1
+        w.line('} else {')
+        w.ind += 1
+        w.call(fn, args)
+        w.ind -= 1
+        w.line('}')
 
     def call(self, op):
         """Print a software kernel call: `c_fn(addr..., param...);`."""
@@ -471,6 +486,8 @@ class Emitter:
                 break  # declarations go before the first loop (e.g. not after a pipeline's `i_last`)
             if isinstance(op, DECLARATIVE) or (isinstance(op, ir.ScalarOp) and op.decl.data):
                 cut = k + 1
+            elif not isinstance(op, (ir.CommentOp, ir.ScalarOp)):
+                break  # nor after a statement that may use them (a pipeline prologue at the top)
         self.block(ops[:cut])
         decl_at = len(self.w.lines)
         self.block(ops[cut:])

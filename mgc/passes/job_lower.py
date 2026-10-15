@@ -9,6 +9,8 @@
   (Jobs written as `enqueue` / `commit_start` / `wait` are already `mg.hwpe`
   steps, placed by the pipeline pass inside `pipeline()`.)
 * `mg.job` on a software L1 kernel        -> `mg.call` (synchronous, CV32 core).
+* jobs switched by uninit-acc in some iterations: their condition is folded
+  (`uninit_acc.fold`), possibly into always / never.
 
 For every job (and HWPE enqueue) the scalar parameters are derived from the
 operand shapes and the constraints are checked, both from the descriptors in
@@ -29,6 +31,7 @@ from .. import ir
 from ..errors import MgcError
 from ..expr import equal
 from .common import eval_shape_expr, kernels, operand_shapes, shape, alloc_of, tensors
+from .uninit_acc import fold
 
 
 def hwpe_params(op, acc, job, ts):
@@ -74,9 +77,11 @@ class JobLower(ModulePass):
                 if '.' in k:
                     acc, job = k.split('.')
                     params = hwpe_params(op, acc, job, ts)
-                    new = ir.HwpeOp.create(operands=list(op.bufs), attributes={
-                        'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr('oneshot'),
-                        'slots': op.slots, 'event': op.event, 'params': ir.exprs(params)})
+                    attrs = {'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr('oneshot'),
+                             'slots': op.slots, 'event': op.event, 'params': ir.exprs(params)}
+                    if op.alt is not None:
+                        attrs.update(alt=op.alt, alt_if=op.alt_if)
+                    new = ir.HwpeOp.create(operands=list(op.bufs), attributes=attrs)
                 else:
                     kd = kdefs[k]
                     names = [o.data.partition(':')[0] for o in kd.operands_.data]
@@ -86,3 +91,14 @@ class JobLower(ModulePass):
                         'kernel': StringAttr(k), 'slots': op.slots, 'params': ir.exprs(params)})
                 new.lineno = getattr(op, 'lineno', None)
                 Rewriter.replace_op(op, new)
+        # jobs switched by uninit-acc in some iterations only: fold the condition
+        # now that the pipeline pass has instantiated the iterations
+        for op in list(module.walk()):
+            if isinstance(op, ir.HwpeOp) and op.alt is not None:
+                cond = fold(op)
+                if cond == 1:
+                    op.attributes['job'] = op.alt
+                if isinstance(cond, int):
+                    del op.attributes['alt'], op.attributes['alt_if']
+                else:
+                    op.attributes['alt_if'] = ir.E(cond)

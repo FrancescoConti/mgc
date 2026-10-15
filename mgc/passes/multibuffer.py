@@ -18,6 +18,8 @@ Where the selection goes: at an explicit `rotate(v)` if present; otherwise just
 before the first statement, in the innermost block holding every use, that
 contains a use (comments directly above it stay attached to it). Pointers are
 emitted for offset 0 plus every offset used, matching the hand-written tests.
+Uses are grouped by the loop binding `v`, so loops reusing a variable name get
+one selection each.
 """
 
 from __future__ import annotations
@@ -46,6 +48,18 @@ def ptr_name(kind, name, k):
     return f'{name}_' + ('curr' if k == 0 else ('next' if k > 0 else 'prev') + (str(abs(k)) if abs(k) > 1 else ''))
 
 
+def binder(op, var):
+    """The loop around `op` that binds `var`: a `for` over it, or the time loop
+    of a systolic() whose body declares it (None if there is none)."""
+    p = op.parent_op()
+    while p is not None:
+        if isinstance(p, ir.ForOp) and (p.var.data == var or any(
+                isinstance(o, ir.ScalarOp) and o.decl.data and o.sym.data == var for o in p.body.block.ops)):
+            return p
+        p = p.parent_op()
+    return None
+
+
 def static_name(kind, name, depth, c):
     """C name for a constant slot `c` (wrapped modulo `depth`): `l1_addr_x_1`
     for buffers, `&ev_1` for events."""
@@ -70,7 +84,7 @@ class MultiBuffer(ModulePass):
         evarrays = {o.sym.data: o for o in module.walk() if isinstance(o, ir.EventsOp)}
         allocs = [o for o in module.walk() if isinstance(o, ir.AllocOp)]
         order = {a.sym.data: k for k, a in enumerate(allocs)}
-        uses = {}  # var -> list of (op, kind, name, depth, offset)
+        uses = {}  # (var, id of its loop) -> list of (op, kind, name, depth, offset)
 
         def resolve(op, kind, name, depth, idx):
             k = const_of(idx)
@@ -87,7 +101,7 @@ class MultiBuffer(ModulePass):
                 raise MgcError(op, f'index of `{name}` must be `{var} + k` with a constant k')
             if abs(off) >= depth:
                 off = next(k for k in ORDER if (k - off) % depth == 0)
-            uses.setdefault(var, []).append((op, kind, name, depth, off))
+            uses.setdefault((var, id(binder(op, var))), []).append((op, kind, name, depth, off))
             return ptr_name(kind, name, off)
 
         for op in list(module.walk()):
@@ -110,8 +124,9 @@ class MultiBuffer(ModulePass):
                     cname = resolve(op, 'evt', e.name, d, e.index)
                     op.attributes[attr] = ir.EvtAttr(ir.EvtRef(e.kind, e.name, e.dir, e.index, cname))
 
-        markers = {o.var.data: o for o in module.walk() if isinstance(o, ir.SelectOp)}
-        for var, us in uses.items():
+        markers = {(o.var.data, id(binder(o, o.var.data))): o for o in module.walk() if isinstance(o, ir.SelectOp)}
+        for key, us in uses.items():
+            var = key[0]
             by_depth = {}
             for op, kind, name, depth, off in us:
                 ent = by_depth.setdefault(depth, {})
@@ -124,8 +139,8 @@ class MultiBuffer(ModulePass):
                            for kind, name in keys]
                 selects.append(ir.SelectOp.create(attributes={
                     'var': StringAttr(var), 'depth': IntAttr(depth), 'entries': ir.SelectAttr(entries)}))
-            if var in markers:
-                m = markers.pop(var)
+            if key in markers:
+                m = markers.pop(key)
                 Rewriter.insert_op(selects, InsertPoint.before(m))
                 m.detach()
                 m.erase()
@@ -142,5 +157,5 @@ class MultiBuffer(ModulePass):
             while isinstance(prev, ir.CommentOp):
                 first, prev = prev, prev.prev_op
             Rewriter.insert_op(selects, InsertPoint.before(first))
-        for var, m in markers.items():
+        for (var, _), m in markers.items():
             raise MgcError(m, f'rotate({var}): no multi-buffer is indexed by `{var}`')

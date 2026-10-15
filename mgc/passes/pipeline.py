@@ -31,6 +31,10 @@ Checks:
 * `sync()` in a `pipeline()` stage needs a trip count that is the same on all
   tiles; `systolic()` stages do not take `sync()`.
 
+Several loops per test are expanded one after the other. A depth left to the
+pass is the largest any of them needs; a scalar that the prologues of two loops
+declare in the same block is declared by the first only.
+
 `systolic` (with `skew`) wraps the steps in a global time loop, identical on
 all tiles, in which the tile is active when 0 <= t - skew <= last step, with a
 barrier ending every time step. Its length is max(skew + n) + S - 2 over the
@@ -255,10 +259,15 @@ class Pipeline(ModulePass):
 
     def apply(self, ctx, module):
         pipes = [op for op in module.walk() if isinstance(op, ir.PipelineOp)]
-        if len(pipes) > 1:
-            raise MgcError(pipes[1], 'only one pipeline() or systolic() per test is supported for now')
+        # storages whose depth is left to the pass: raised to the largest need over all the loops
+        inferred = {id(o) for o in module.walk() if isinstance(o, (ir.AllocOp, ir.EventsOp)) and o.depth.data == 0}
+        declared = {}  # id(block) -> scalars declared there by the prologues so far
+        docs = []
         for p in pipes:
-            self.expand(module, p)
+            docs.append(self.expand(module, p, inferred, declared))
+        # schedule comments last: a later loop may have raised a depth
+        for op, kind, var, S, table in docs:
+            op.attributes['text'] = StringAttr(self.schedule_doc(kind, var, S, table))
         for o in module.walk():
             if isinstance(o, ir.AllocOp) and o.depth.data == 0:
                 raise MgcError(o, f'`{o.sym.data}` is not used by a pipeline(): give it a depth= '
@@ -267,8 +276,9 @@ class Pipeline(ModulePass):
                 raise MgcError(o, f'`{o.sym.data}` is not used by a pipeline(): give it a size, '
                                   f'{o.kind.data}.events(n)')
 
-    def expand(self, module, p):
-        """Replace the `mg.pipeline` op `p` with prologue + loop."""
+    def expand(self, module, p, inferred, declared):
+        """Replace the `mg.pipeline` op `p` with prologue + loop. Returns its
+        schedule comment op, to be filled in once every loop is expanded."""
         var = p.var.data
         n = p.n.data
         systolic = p.kind.data == 'systolic'
@@ -295,13 +305,14 @@ class Pipeline(ModulePass):
         issues = self.match_events(uses, var)
         self.split_job_events(issues, var, kdefs)
         self.check_hwpe(uses, issues, blocks, var)
-        self.cross_stage_events(module, p, issues, var)
-        table = self.depths(module, uses, issues, var, kdefs, remote=not systolic)
+        self.cross_stage_events(module, p, issues, var, inferred)
+        table = self.depths(module, uses, issues, var, kdefs, inferred, remote=not systolic)
 
         step = Sym(var, None, 'int')
-        out = self.prologue(p, blocks, var)
+        out = self.prologue(p, blocks, var, declared.setdefault(id(p.parent_block()), {}))
         out += docs
-        out.append(self.schedule_doc(p, S, table))
+        doc = ir.CommentOp.create(attributes={'text': StringAttr(''), 'style': StringAttr('block')})
+        out.append(doc)
         body = self.step(blocks, var, step, n, S)
 
         if not systolic:
@@ -330,8 +341,10 @@ class Pipeline(ModulePass):
                 if getattr(x, 'lineno', None) is None:
                     x.lineno = getattr(p, 'lineno', None)
         Rewriter.insert_op(out, InsertPoint.before(p))
+        kind = p.kind.data
         p.detach()
         p.erase()
+        return doc, kind, var, S, table
 
     # -- checks --------------------------------------------------------------
     def check_syncs(self, p, uses, systolic):
@@ -515,10 +528,12 @@ class Pipeline(ModulePass):
         e[f] = True
 
     @staticmethod
-    def cross_stage_events(module, p, issues, var):
+    def cross_stage_events(module, p, issues, var, inferred):
         """An event waited in a later stage than the one issuing it is in flight
-        for several iterations: give it per-iteration storage, a new event
-        array indexed by `var` (DMA events and the default job event)."""
+        for several iterations: give it per-iteration storage, an event array
+        indexed by `var` (DMA events and the default job event), shared with an
+        earlier loop that needed the same one."""
+        existing = {o.sym.data for o in module.walk() if isinstance(o, ir.EventsOp)}
         cross = {}
         for it in issues:
             if it.last > it.use.k and it.key[0] != 'array':
@@ -531,8 +546,10 @@ class Pipeline(ModulePass):
             else:
                 arr, ekind = f'{name}_{job}_evts' if job else f'{name}_evts', name
             cross[key] = arr
-            arrays.append(ir.EventsOp.create(attributes={'sym': StringAttr(arr), 'depth': IntAttr(0),
-                                                         'kind': StringAttr(ekind)}))
+            if arr not in existing:
+                arrays.append(ir.EventsOp.create(attributes={'sym': StringAttr(arr), 'depth': IntAttr(0),
+                                                             'kind': StringAttr(ekind)}))
+                inferred.add(id(arrays[-1]))
         if not cross:
             return
         for it in issues:
@@ -543,7 +560,7 @@ class Pipeline(ModulePass):
                 it.key = ('array', cross[it.key], None, ('rel', 0))
         Rewriter.insert_op(arrays, InsertPoint.before(p))
 
-    def depths(self, module, uses, issues, var, kdefs, remote):
+    def depths(self, module, uses, issues, var, kdefs, inferred, remote):
         """Stages touched by each storage indexed `[var + c]`: an op touches its
         buffers in its stage, and keeps those of a transfer/job (and its event)
         until its wait. Slot `var + c` in stage k belongs to iteration var + c,
@@ -582,13 +599,13 @@ class Pipeline(ModulePass):
             op = allocs[name] if kind == 'buf' else evarrays[name]
             need = hi - lo + 1
             what = (f'multi-buffer `{name}`' if kind == 'buf' else f'event array `{name}`')
-            if op.depth.data == 0:
-                op.attributes['depth'] = IntAttr(max(2, need) if kind == 'buf' else need)
+            if id(op) in inferred:
+                op.attributes['depth'] = IntAttr(max(op.depth.data, max(2, need) if kind == 'buf' else need))
             elif op.depth.data < need:
                 fix = 'depth=' if kind == 'buf' else f'{op.kind.data}.events('
                 raise MgcError(op, f'{what} is used in stages {lo}..{hi}, so it holds {need} iterations at once: '
                                    f'declare it with {fix}{need}{"" if kind == "buf" else ")"} or more (or omit it)')
-            table.append((name, lo, hi, op.depth.data))
+            table.append((name, lo, hi, op))
         return table
 
     # -- tiles ---------------------------------------------------------------
@@ -674,11 +691,12 @@ class Pipeline(ModulePass):
                 pending = [e for e in pending if e.key() != op.event.data.key()]
         return pending
 
-    def prologue(self, p, blocks, var):
+    def prologue(self, p, blocks, var, declared):
         """The stage-0 blocks of iteration 0, in textual order. DMA transfers
         issued before the pipeline and not yet waited are waited before the
         first commit of a job that needs them, or at the end for the jobs of
-        later stages."""
+        later stages. A scalar already declared in this block by an earlier
+        prologue (`declared`: name -> C type) is assigned instead."""
         pending = [e for e in self.outer_pending(p) if e.kind == 'idma']
         out, enq = [], {}
         for b in blocks:
@@ -693,6 +711,14 @@ class Pipeline(ModulePass):
                     names = enq.get(o.acc.data, set())
                     out += [wait(ir.EvtRef(e.kind, e.name, e.dir)) for e in pending if e.name in names]
                     pending = [e for e in pending if e.name not in names]
+                if isinstance(o, ir.ScalarOp) and o.decl.data:
+                    name, ctype = o.sym.data, o.ctype.data
+                    if name in declared:
+                        if declared[name] != ctype:
+                            raise MgcError(o, f'`{name}` is declared as {declared[name]} by the prologue of an '
+                                              f'earlier loop and as {ctype} here: use another name')
+                        o.attributes['decl'] = IntAttr(0)
+                    declared[name] = ctype
                 out.append(o)
         # operands of the jobs of later stages still in flight from before the pipeline
         need = {alloc_of(v).sym.data for b in blocks for top in b.ops for o in top.walk()
@@ -728,12 +754,11 @@ class Pipeline(ModulePass):
         return out
 
     @staticmethod
-    def schedule_doc(p, S, table):
-        """Block comment before the loop: stage/iteration mapping and the
-        stages and depth of each rotating storage."""
-        var = p.var.data
-        lines = [f'{p.kind.data}: {S} stages; step {var} runs stage k on iteration {var} + 1 - k']
+    def schedule_doc(kind, var, S, table):
+        """Text of the block comment before the loop: stage/iteration mapping
+        and the stages and (final) depth of each rotating storage."""
+        lines = [f'{kind}: {S} stages; step {var} runs stage k on iteration {var} + 1 - k']
         w = max((len(name) for name, *_ in table), default=0)
-        for name, lo, hi, depth in table:
-            lines.append(f'  {name.ljust(w)}  stages {lo}..{hi}  depth {depth}')
-        return ir.CommentOp.create(attributes={'text': StringAttr('\n'.join(lines)), 'style': StringAttr('block')})
+        for name, lo, hi, op in table:
+            lines.append(f'  {name.ljust(w)}  stages {lo}..{hi}  depth {op.depth.data}')
+        return '\n'.join(lines)

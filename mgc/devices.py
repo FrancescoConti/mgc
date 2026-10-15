@@ -57,10 +57,16 @@ class HwpeJob:
     mglib call as `(C type, expression)` over operand shapes, e.g.
     `('uint16_t', 'x.shape[0]')`. `constraints`: pairs of shape expressions that
     must be equal, e.g. `('x.shape[1]', 'w.shape[0]')` (inner GEMM dimension).
+    `op`: the symbol that selects the job in `enqueue(..., op=GEMM)`; when the
+    jobs of an accelerator have one, `op=` is required. `if_uninit`: a job that
+    gives the same result when the `inout` operands hold nothing yet (the
+    uninit-acc pass switches to it), e.g. `matmul` for `gemm`.
     """
     operands: Tuple[Tuple[str, str, int], ...]  # (name, role in|out|inout, rank)
     params: Tuple[Tuple[str, str], ...]  # (C type, expression over operand shapes)
     constraints: Tuple[Tuple[str, str], ...]  # pairs of shape expressions that must be equal
+    op: str = ''  # `op=` symbol in enqueue
+    if_uninit: str = ''  # equivalent job when the inout operands are not initialized
 
 
 @dataclass(frozen=True)
@@ -72,7 +78,8 @@ class Hwpe:
     supported jobs by name, and `fn` the mglib function used for each protocol
     step (`enqueue`, `oneshot`, `commit`, `start`, `commit_start`, `wait`),
     where `{job}` expands to the job name (`mg_redmule_{job}_enqueue` ->
-    `mg_redmule_gemm_enqueue`).
+    `mg_redmule_gemm_enqueue`). Commit and start act on the whole queue,
+    whatever its jobs: they take the name of the first job.
     """
     name: str
     queue_depth: int  # hardware job queue
@@ -91,7 +98,16 @@ HWPES: Dict[str, Hwpe] = {
                      params=(('uint16_t', 'x.shape[0]'), ('uint16_t', 'x.shape[1]'),
                              ('uint16_t', 'w.shape[1]')),
                      constraints=(('x.shape[1]', 'w.shape[0]'), ('x.shape[0]', 'y.shape[0]'),
-                                  ('w.shape[1]', 'y.shape[1]'))),
+                                  ('w.shape[1]', 'y.shape[1]')),
+                     op='GEMM', if_uninit='matmul'),
+             # z = x @ w (no accumulation: z is not read)
+             'matmul':
+             HwpeJob(operands=(('x', 'in', 2), ('w', 'in', 2), ('z', 'out', 2)),
+                     params=(('uint16_t', 'x.shape[0]'), ('uint16_t', 'x.shape[1]'),
+                             ('uint16_t', 'w.shape[1]')),
+                     constraints=(('x.shape[1]', 'w.shape[0]'), ('x.shape[0]', 'z.shape[0]'),
+                                  ('w.shape[1]', 'z.shape[1]')),
+                     op='MATMUL'),
          },
          fn={
              'enqueue': 'mg_redmule_{job}_enqueue',

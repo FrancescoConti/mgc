@@ -25,6 +25,7 @@ WFE = 'WFE'
 POLLING = 'POLLING'
 CORE = 'CORE'  # L1-kernel executor: the tile's CV32 control core
 GLOBAL, ROW, COL = 'GLOBAL', 'ROW', 'COL'  # sync() / pipeline(sync=...) scopes
+GEMM, MATMUL = 'GEMM', 'MATMUL'  # redmule.enqueue(..., op=...): y += x @ w / z = x @ w
 
 # loop levels: spatial (tiles), time (range / pipeline), reserved (cores)
 tiles = pipeline = cores = check = comment = sync = rotate = _stub
@@ -40,8 +41,8 @@ class _Ns:
 
 L1 = _Ns()  # L1.single_buffer(view), L1.multi_buffer(view, depth=N)
 idma = _Ns()  # idma.load(dst, src), idma.store(dst, src)
-redmule = _Ns()  # gemm / enqueue / commit / start / commit_start / events
+redmule = _Ns()  # gemm / matmul / enqueue / commit / start / commit_start / events
 
 __all__ = ['sizes', 'l2', 'define', 'test', 'top', 'l1_kernel', 'fp16', 'u8', 'u16', 'u32', 'i32', 'WFE', 'POLLING',
-           'CORE', 'GLOBAL', 'ROW', 'COL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
+           'CORE', 'GLOBAL', 'ROW', 'COL', 'GEMM', 'MATMUL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
            'LAST', 'L1', 'idma', 'redmule']
