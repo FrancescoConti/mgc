@@ -173,10 +173,13 @@ Allowed transfers follow `devices.IDMA`. After merging contiguous dimensions, a 
 most `max_rank`-dimensional (currently 2: `mg_idma_memcpy_1d/2d`), with unit steps and a dense
 L1 side. L1→L1 within a tile and L2→L2 are rejected.
 
-Row/column multicasts are lowered by `idma-mcast` to one unicast per destination tile (a `for` over
-`MESH_X_TILES`/`MESH_Y_TILES` that skips the issuing tile), all on the same event: same-direction
-iDMA transfers complete in issue order, so one `e.wait()` waits for all of them. Once the iDMA
-supports multicast in hardware, an `IDMA.multicast` entry makes it a single call.
+Row/column multicasts of a 1-D block are a single call to `mg_idma_mcast_row/col` (the
+`IDMA.multicast` entries): one 2D iDMA job per contiguous run of destination tiles, reading the
+source with stride 0 and writing with the L1 stride between tiles, so the bursts towards successive
+tiles overlap in the NoC. Other multicasts are lowered by `idma-mcast` to one unicast per
+destination tile (a `for` over `MESH_X_TILES`/`MESH_Y_TILES` that skips the issuing tile). Either
+way all the jobs stamp the same event: same-direction iDMA transfers complete in issue order, so
+one `e.wait()` waits for all of them.
 
 Each L1 buffer has one event per direction (`idma_evt_<buf>_in/_out`). The two are merged into
 `idma_evt_<buf>` when they are never pending at the same time. The following are compile errors:
@@ -562,7 +565,7 @@ IR conventions:
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection, one per loop |
 | `l1-layout` | identical L1 layout on all tiles, shared between loops for pinned buffers; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
 | `event-alloc` | event variable names; dataflow check of issue/wait |
-| `idma-mcast` | row/column multicasts → loops of unicast transfers, unless `devices.IDMA.multicast` lists the scope |
+| `idma-mcast` | row/column multicasts → loops of unicast transfers, unless `devices.IDMA.multicast` lists the scope (1-D blocks) |
 | `emit-c` | prints C; each buffer's `len_/std_/reps_/l1_addr_/l2_addr_` is declared once and referenced by name |
 
 Extending:

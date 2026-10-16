@@ -6,8 +6,8 @@
 """idma-mcast: row/column multicasts -> unicast transfers.
 
 `idma.store(q.row, q)` copies `q` into the same slot of `q` on every other
-tile of this tile's row. Until the iDMA supports it natively (a
-`devices.IDMA.multicast` entry for the scope), it becomes one unicast per
+tile of this tile's row. A 1-D block with a `devices.IDMA.multicast` entry
+for the scope stays a single native call; otherwise it becomes one unicast per
 destination tile:
 
     for (uint32_t mcast_q = 0; mcast_q < MESH_X_TILES; mcast_q++) {
@@ -52,8 +52,10 @@ class IdmaMcast(ModulePass):
                 continue
             r = op.remote.owner
             mode = r.mode.data
-            if mode not in MESH or mode.upper() in devices.IDMA.multicast:
+            if mode not in MESH:
                 continue
+            if mode.upper() in devices.IDMA.multicast and op.xfer.data.rank == 1:
+                continue  # native multicast (1-D blocks only)
             var = Sym(f'mcast_{alloc_of(op.local).sym.data}', None, 'uint32_t')
             ty, tx, me = (y, var, x) if mode == 'row' else (var, x, y)
             rattrs = {'mode': StringAttr('abs'), 'ty': ir.E(ty), 'tx': ir.E(tx)}

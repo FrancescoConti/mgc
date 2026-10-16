@@ -41,7 +41,9 @@ class IdmaCaps:
 
 
 IDMA = IdmaCaps(max_rank=2, l1_strided=False,
-                functions={1: 'mg_idma_memcpy_1d', 2: 'mg_idma_memcpy_2d'})
+                functions={1: 'mg_idma_memcpy_1d', 2: 'mg_idma_memcpy_2d'},
+                # one 2D job (source stride 0) per contiguous run of destination tiles, 1-D blocks only
+                multicast={'ROW': 'mg_idma_mcast_row', 'COL': 'mg_idma_mcast_col'})
 
 # ----------------------------------------------------------------------------
 # HWPE accelerators (acquire/enqueue -> commit -> start -> event)
