@@ -1,4 +1,4 @@
 {"groups": [
-  {"tests": ["unfused_attn", "flat_attn_pipeopt3"], "tiles": [4], "S": [1024, 2048], "P": [64, 128, 256], "S_BLOCK_SIZE_Q": 512,  "S_BLOCK_SIZE_LV": 512 },
-  {"tests": ["unfused_attn", "flat_attn_pipeopt3"], "tiles": [8], "S": [1024, 2048], "P": [64, 128, 256], "S_BLOCK_SIZE_Q": 1024, "S_BLOCK_SIZE_KV": 1024}
+  {"tests": ["unfused_attn", "flat_attn_pipeopt3"], "tiles": [4], "S": [1024, 2048], "P": [64, 128, 256], "S_BLOCK_SIZE_Q": [512],  "S_BLOCK_SIZE_KV": [512] },
+  {"tests": ["unfused_attn", "flat_attn_pipeopt3"], "tiles": [8], "S": [1024, 2048], "P": [64, 128, 256], "S_BLOCK_SIZE_Q": [1024], "S_BLOCK_SIZE_KV": [1024]}
 ]}
