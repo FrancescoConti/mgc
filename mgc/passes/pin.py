@@ -15,11 +15,13 @@ the statements between two loops belong to both. A buffer pinned to loops lo..hi
   its `.wait()`;
 * in the statements between loops k and k + 1, buffers pinned up to k are used
   before buffers pinned from k + 1 on;
-* is not accessed by other tiles (`.at()`, `.at_rel()`, `.row`, `.col`): a slower
-  tile could still write into memory this tile already reuses.
+* if accessed by other tiles (`.at()`, `.at_rel()`, `.row`, `.col`), is separated by
+  a top-level `sync(GLOBAL)` from the uses of the buffers pinned to the loops before
+  and after its own: otherwise a slower tile could still write into memory this tile
+  already reuses (or a faster one into memory it still uses).
 
-Every tile only reuses memory it alone touches, in program order, so the layout is
-safe without any cross-tile timing. The pass records `pin_lo`..`pin_hi` (indices of
+Every tile only reuses memory it alone touches, in program order, or behind a global
+barrier, so the layout is safe without any other cross-tile timing. The pass records `pin_lo`..`pin_hi` (indices of
 the named loops) on each pinned `mg.alloc`.
 """
 
@@ -93,15 +95,16 @@ class PinCheck(ModulePass):
                 op = op.parent_op()
             return pos[id(op)]
 
-        # top-level positions where each pinned buffer is used (transfers and jobs until their wait)
+        # top-level positions where each pinned buffer is used (transfers and jobs until their wait),
+        # also through other tiles' copies
         ops = list(module.walk())
         uses = {k: [] for k in pinned}
+        remote = {}
         for n, op in enumerate(ops):
             if isinstance(op, ir.RemoteOp) and id(alloc_of(op.res)) in pinned:
-                raise MgcError(op, f'`{alloc_of(op.res).sym.data}` is pinned to a loop and cannot be accessed by '
-                                   'other tiles')
+                remote.setdefault(id(alloc_of(op.res)), op)
             if isinstance(op, ir.IdmaOp):
-                bufs = [op.local]
+                bufs = [op.local] + ([op.remote] if op.remote is not None else [])
             elif isinstance(op, (ir.HwpeOp, ir.JobOp, ir.CallOp)):
                 bufs = list(op.bufs)
             else:
@@ -138,3 +141,23 @@ class PinCheck(ModulePass):
                                              f'a buffer pinned up to "{loops[k].label.data}" is still used here or '
                                              f'later: it may share L1 with the buffers of '
                                              f'"{loops[k + 1].label.data}"')
+
+        # buffers accessed by other tiles: a global barrier between their uses and those of the buffers
+        # pinned to the loops before (after) theirs
+        barriers = [k for k, o in enumerate(top) if isinstance(o, ir.SyncOp) and o.scope.data == 'GLOBAL']
+        for k, rop in remote.items():
+            a = pinned[k]
+            own = [p for p, _ in uses[k]]
+            if not own:
+                continue
+            for side, others in (('before', [p for i, b in pinned.items() if b.pin_hi.data < a.pin_lo.data
+                                             for p, _ in uses[i]]),
+                                 ('after', [p for i, b in pinned.items() if b.pin_lo.data > a.pin_hi.data
+                                            for p, _ in uses[i]])):
+                if not others:
+                    continue
+                lo, hi = (max(others), min(own)) if side == 'before' else (max(own), min(others))
+                if not any(lo < s < hi for s in barriers):
+                    raise MgcError(rop, f'`{a.sym.data}` is pinned to a loop and accessed by other tiles: it needs a '
+                                        f'sync(GLOBAL) in the tiles() body between its uses and those of the buffers '
+                                        f'pinned to the loops {side} its own')

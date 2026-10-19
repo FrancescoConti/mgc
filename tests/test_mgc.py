@@ -20,7 +20,7 @@ from mgc import devices  # noqa: E402
 from mgc.driver import compile_module, compile_source, print_ir  # noqa: E402
 from mgc.errors import MgcError  # noqa: E402
 
-MESH = os.path.join(REPO, 'tests', 'magia', 'mesh')
+MESH = os.path.join(REPO, 'tests', 'magia', 'mgc')
 OS, WS, IS, L1K = (os.path.join(MESH, d) for d in ('mm_os_mgc', 'mm_ws_mgc', 'mm_is_mgc', 'mm_os_l1k'))
 MM = os.path.join(MESH, 'mm_matmul_mgc')
 
@@ -995,10 +995,29 @@ def main():
                            '        ex.wait()\n'
                            '        for i in pipeline(steps, name="two"):\n')], 'between loops "one" and "two"')
 
-    def test_not_accessed_by_other_tiles(self):
-        self.assertError([('                ea.wait()\n',
-                           '                ea.wait()\n                idma.store(a.at_rel(0, 1)[i], a[i]).wait()\n')],
-                         'cannot be accessed by other tiles')
+    # b written into the next tile's copy, after loop two
+    REMOTE_B = ('        for i in pipeline(steps, name="three"):\n',
+                '        idma.store(b.at_rel(0, 1)[0], b[0]).wait()\n        for i in pipeline(steps, name="three"):\n')
+
+    def test_accessed_by_other_tiles_without_barrier(self):
+        self.assertError([self.REMOTE_B], 'needs a sync(GLOBAL) in the tiles() body between its uses and those of '
+                                          'the buffers pinned to the loops before its own')
+
+    def test_accessed_by_other_tiles_one_barrier(self):
+        self.assertError([self.REMOTE_B, ('        for i in pipeline(steps, name="two"):\n',
+                                          '        sync(GLOBAL)\n        for i in pipeline(steps, name="two"):\n')],
+                         'pinned to the loops after its own')
+
+    def test_accessed_by_other_tiles_behind_barriers(self):
+        # b, written by other tiles, still shares L1 with a and c: global barriers around loop two
+        c = self.c(self.REMOTE_B,
+                   ('        for i in pipeline(steps, name="two"):\n',
+                    '        sync(GLOBAL)\n        for i in pipeline(steps, name="two"):\n'),
+                   ('        for i in pipeline(steps, name="three"):\n',
+                    '        sync(GLOBAL)\n        for i in pipeline(steps, name="three"):\n'))
+        self.assertIn('l1_addr_b_0 - l1_tile_base', c)
+        for buf in ('a', 'b', 'c'):
+            self.assertIn(f'uint32_t l1_addr_{buf}_0 = l1_addr_w + (', c)
 
     def test_named_loop_in_tile_body(self):
         self.assertError([('        for i in pipeline(steps, name="three"):\n',

@@ -308,8 +308,11 @@ pinned buffer
   `.wait()`;
 - in the statements between its loop and the next one, is used before every buffer pinned to
   the next loop;
-- is not accessed by other tiles (`.at()`, `.at_rel()`, `.row`, `.col`), which could still be
-  writing into it after this tile has moved on.
+- if accessed by other tiles (`.at()`, `.at_rel()`, `.row`, `.col`), is separated by a
+  `sync(GLOBAL)` in the `tiles()` body from the uses of the buffers pinned to the loops before
+  and after its own: otherwise another tile could still be writing into it after this tile has
+  moved on (as in `tests/magia/mgc/mhsa_pipeopt3`, whose Flat-Attention buffers share L1 with
+  the projections).
 
 `pin=("qk", "softmax")` pins a buffer to several loops, which must be back-to-back: it lives
 from the stretch of the first to the stretch of the last, and keeps its contents in between.
@@ -559,7 +562,7 @@ IR conventions:
 |---|---|
 | `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
 | `uninit-acc` | GEMM jobs whose accumulator is not initialized → MATMUL (`if_uninit` in the descriptors), always or in the first iteration of their loops |
-| `pin-check` | checks the buffers pinned to named loops (`pin=`) against the stretches of their loops; records each one's loops for `l1-layout` |
+| `pin-check` | checks the buffers pinned to named loops (`pin=`) against the stretches of their loops (and the global barriers around those accessed by other tiles); records each one's loops for `l1-layout` |
 | `pipeline` | `mg.pipeline` + `mg.stage` blocks → prologue and guarded step loop, one loop at a time; depth inference/checks (over all the loops), per-iteration events, HWPE queue simulation |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors; folds the `uninit-acc` conditions |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection, one per loop |
