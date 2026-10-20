@@ -21,12 +21,12 @@ sources. Metrics:
     its own output tile, to the end of the last iDMA store (L1->L2)
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
-    plus the Q, Kt, V and output projections)
+    plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
 
-Parameters (S, D, P, H, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
+Parameters (S, D, P, H, HKV, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 place. The test sources are restored at the end (also on Ctrl-C, or on the next start if the
 script was killed). D and H are written to test.h but not used by the current attention kernels.
@@ -87,8 +87,8 @@ SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
-PARAMS = ['S', 'D', 'P', 'H', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
-HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS',
+PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
+HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
                   'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE'}
 MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'T_SIZE']
 # Only the gvsoc events analyze() reads (make's defaults dump ~20x more: asm, NoC, L2, ...),
@@ -124,7 +124,7 @@ CSV_COLUMNS = [
 # (header, csv column, format) of the human-readable table
 TABLE = [
     ('id', 'run_id', '{}'), ('test', 'test', '{}'), ('tiles', 'tiles', '{}'), ('S', 'S', '{}'),
-    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
+    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
     ('T', 'T_SIZE', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
@@ -169,6 +169,8 @@ class Test:
             self.kind = 'flat_attn'
         elif name.startswith('mhsa'):
             self.kind = 'mhsa'
+        elif name.startswith('gqa'):
+            self.kind = 'gqa'
         elif name == 'unfused_attn':
             self.kind = 'unfused_attn'
         else:
@@ -198,11 +200,12 @@ class Test:
         if self.kind == 'mm':
             return cfg['M'] * cfg['N'] * cfg['K'] * self.n_iterations
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
-        if self.kind != 'mhsa':
+        if self.kind not in ('mhsa', 'gqa'):
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
-        # mhsa: + Q, Kt, V and output projections, S*D*(H*P) each
+        # mhsa: + Q, Kt, V and output projections, S*D*(H*P) each; gqa: Kt and V on HKV heads only
         S, D, P, H = cfg['S'], cfg['D'], cfg['P'], cfg['H']
-        return 2 * S * S * P * H + 4 * S * D * P * H
+        HKV = cfg['HKV'] if self.kind == 'gqa' else H
+        return 2 * S * S * P * H + 2 * S * D * P * H + 2 * S * D * P * HKV
 
     def check(self, cfg, tiles):
         """Reason why (cfg, tiles) cannot run, or None."""
@@ -214,7 +217,9 @@ class Test:
                 return 'M and K must be multiples of tiles'
             if cfg['T_SIZE'] and (cfg['N'] % cfg['T_SIZE'] or cfg['N'] // cfg['T_SIZE'] < 2):
                 return 'N must be a multiple of T_SIZE, at least 2 timeslots'
-        if self.kind in ('flat_attn', 'mhsa'):
+        if self.kind == 'gqa' and cfg['H'] % cfg['HKV']:
+            return 'H must be a multiple of HKV'
+        if self.kind in ('flat_attn', 'mhsa', 'gqa'):
             S, bq, bkv = cfg['S'], cfg['S_BLOCK_SIZE_Q'], cfg['S_BLOCK_SIZE_KV']
             if tiles & (tiles - 1):
                 return 'tiles must be a power of 2'
@@ -293,19 +298,24 @@ def generate(test, cfg, tiles, args, srcs, log):
     if test.kind == 'mm':
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
     else:
-        key = '%s_S%s_D%s_P%s_H%s_KV%s_T%d' % (test.kind, cfg['S'], cfg['D'], cfg['P'], cfg['H'],
-                                              cfg['S_BLOCK_SIZE_KV'], tiles)
+        # the flat_attn tests share one generator; mhsa/gqa tests have their own (e.g. the _masked ones)
+        key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind if test.kind == 'flat_attn' else test.name,
+                                                cfg['S'], cfg['D'], cfg['P'], cfg['H'],
+                                                '_HKV%s' % cfg['HKV'] if test.kind == 'gqa' else '',
+                                                cfg['S_BLOCK_SIZE_KV'], tiles)
     cache = os.path.join(args.cache, key)
     cached = os.path.join(cache, 'test.h')
     if not os.path.exists(cached):
         log('  generating test.h (%s)...' % key)
         os.makedirs(cache, exist_ok=True)
         env = dict(os.environ)
-        if test.kind in ('flat_attn', 'mhsa'):
+        if test.kind in ('flat_attn', 'mhsa', 'gqa'):
             gen = FLAT_GEN if test.kind == 'flat_attn' else os.path.join(test.dir, 'gen_golden.py')
             cmd = [args.gen_python, gen, '--s_size', cfg['S'], '--e_size', cfg['D'],
                    '--p_size', cfg['P'], '--n_heads', cfg['H'], '--block_kv', cfg['S_BLOCK_SIZE_KV'],
                    '--tiles', tiles, '--inc_dir', cache]
+            if test.kind == 'gqa':
+                cmd += ['--n_kv_heads', cfg['HKV']]
         elif test.kind == 'mm':
             cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', cache]
         else:
@@ -777,7 +787,7 @@ def main():
                          'in runs/<id>/')
     ap.add_argument('--timeout', type=int, help='kill a simulation after this many seconds (status TIMEOUT)')
     ap.add_argument('--l2-size', help='gvsoc L2 size (make l2_size=..., e.g. 0x10000000), for tests with data in '
-                    '.l2ext above the default L2 (mhsa_pipeopt3 with more than 12 MiB of L2 arrays)')
+                    '.l2ext above the default L2 (mhsa/gqa_pipeopt3 with more than 12 MiB of L2 arrays)')
     ap.add_argument('--trace-processor', metavar='BIN',
                     help='perfetto trace_processor_shell to use (default: the perfetto package\'s own, or '
                          'v47.0 on hosts with glibc < 2.34)')
