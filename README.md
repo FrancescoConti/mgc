@@ -1,22 +1,33 @@
 # mgc
 
-mgc ("magic") is a Python-syntax domain-specific language for MAGIA mesh tests. `mgcc.py` compiles a `.mgc`
-file to a C test that uses mglib (`mg_idma_*`, `mg_redmule_*`, `mg_event_*`) and fsync.
+mgc ("magic") is a Python-syntax domain-specific language for MAGIA mesh tests. `mgcc.py`
+compiles a `.mgc` file to a C test on top of magia-sdk's mglib
+(`mg_idma_*`, `mg_redmule_*`, `mg_event_*`) and fsync. mglib is the hand-written C layer; mgc
+generates the same code from a much shorter description of the schedule.
 
-The compiler handles tile partitioning, L1 layout, DMA address/stride arithmetic, multi-buffer
+The compiler handles tile partitioning, L1 layout, iDMA address/stride arithmetic, multi-buffer
 rotation, event storage, the RedMulE enqueue/commit/start sequence and neighbour-tile addressing.
 `.mgc` files are parsed with Python's `ast` module and never executed. The compiler is built on
 [xDSL](https://xdsl.dev).
 
+mgc is a submodule of [magia-sdk](https://github.com/pulp-platform/magia-sdk) (in `mgc/`);
+its tests live in magia-sdk under `tests/magia/mgc`. The commands below run from the magia-sdk
+root. Outside it, set `MAGIA_SDK` to the magia-sdk checkout.
+
 mgc was developed using Claude Opus 5.5 for coding, debugging, and (partially) documentation under
 human guidance.
 
-## Setup and usage
+## Setup
 
 ```sh
+git submodule update --init mgc
 python3 -m venv mgc/.venv
 mgc/.venv/bin/pip install -r mgc/requirements.txt
+```
 
+## Usage
+
+```sh
 # compile (the header defaults to include/test.h next to the source)
 mgc/.venv/bin/python mgc/mgcc.py tests/magia/mgc/mm_os_mgc/mm_os.mgc \
     -o tests/magia/mgc/mm_os_mgc/src/test.c
@@ -40,65 +51,60 @@ mgc/.venv/bin/python -m unittest discover -s mgc/tests
 Generated files are committed next to their source. Regenerate them after editing a `.mgc` file
 or the compiler; the unit tests fail if they are out of date.
 
-## Example tests
+## A first example
 
-| Directory | Source | Content |
-|---|---|---|
-| `tests/magia/mgc/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
-| `tests/magia/mgc/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
-| `tests/magia/mgc/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
-| `tests/magia/mgc/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
-| `tests/magia/mgc/mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
-| `tests/magia/mgc/unfused_attn` | `unfused_attn.mgc`, `src/kernels.c` | unfused attention: three named pipelines in a row (Q @ Kt on RedMulE, row softmax on Spatz, attn @ V on RedMulE), each step's buffers pinned to its loop so that the steps share L1 |
-
-`*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`. The hand-written
-references are `mm_os_mglib`, `mm_ws_mglib` and `mm_is_mglib`; the last two are mglib ports of
-`mm_ws_2` and `mm_is_2` with the same schedule.
-
-Weight-static, complete per-tile code:
+One GEMM per tile, no pipelining (`Y += X @ W`, each tile owns an `M/Y × K/X` block of `Y`):
 
 ```python
-for y_id, x_id in tiles():
-    tile_h = y_id.split(N)
-    tile_w = x_id.split(K)
-    timeslots: u8 = 4
-    t_size: u8 = M // timeslots
-    t_start: u8 = y_id * 2
+from mgc import *
 
-    w = L1.single_buffer(W[tile_h, tile_w])
-    x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
-    y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")   # from include/test.h
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)
 
-    for z in range(N_ITERATIONS):
-        idma.load(w, W[tile_h, tile_w]).wait()
-        for pt in systolic(timeslots, skew=t_start, sync=GLOBAL):
-            with stage(0):                                # load the blocks of timeslot pt
-                if y_id == 0:
-                    ey = idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
-                ex = idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
-            with stage(2):                                # pass the block on (or store it)
-                if y_id == MESH_Y_TILES - 1:
-                    es = idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
-                else:
-                    es = idma.store(y.at_rel(1, 0)[pt], y[pt])   # same slot, tile below
-            with stage(1):                                # y += x @ w
-                j = redmule.enqueue(x[pt], w, y[pt], op=GEMM)
-                redmule.commit_start()
-            with stage(0):                                # end of the step: wait for all of it
-                if y_id == 0:
-                    ey.wait()
-                ex.wait()
-            with stage(2):
-                es.wait()
-            with stage(1):
-                j.wait()
-
-    sync(COL)
-    if y_id == MESH_Y_TILES - 1:
-        check(Y[:, tile_w], Z[:, tile_w], tol=0x11)
+@test("test_tiny")
+def main():
+    for y_id, x_id in tiles():
+        tile_h = y_id.split(M)                    # rows owned by this tile
+        tile_w = x_id.split(K)                    # columns owned by this tile
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
+        idma.load(x, X[tile_h, :])
+        idma.load(w, W[:, tile_w])
+        idma.load(y, Y[tile_h, tile_w]).wait()
+        redmule.gemm(x, w, y)
+        idma.store(Y[tile_h, tile_w], y).wait()
 ```
 
+The 14 source lines become about 130 lines of C (excerpt):
+
+```c
+uint32_t len_w     = tile_w * 2;                 // one row of the W block, in bytes
+uint32_t std_w     = K_SIZE * 2;                 // row stride in L2
+uint32_t reps_w    = (uint32_t)N_SIZE;           // number of rows
+uint32_t l1_addr_w = l1_addr_x + (tile_h * N_SIZE * 2);   // L1 layout: x, then w, then y
+uint32_t l2_addr_w = (uint32_t)w_inp + (tile_w_max * x_id * 2);
+...
+mg_idma_memcpy_2d(WAIT_MODE, 0, l2_addr_w, l1_addr_w, len_w, std_w, reps_w, &idma_evt_w, NULL);
+...
+mg_redmule_gemm(WAIT_MODE, l1_addr_x, l1_addr_w, l1_addr_y,
+                (uint16_t)tile_h, (uint16_t)N_SIZE, (uint16_t)tile_w, &redmule_evt, NULL);
+```
+
+The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-idma` turns it into a 2-D
+transfer, while `X[tile_h, :]` is contiguous and stays 1-D. The GEMM dimensions come from the
+buffer shapes, and the `tile_h`/`tile_w` borders handle meshes that do not divide the problem.
+To see the intermediate steps, run `mgcc.py tiny.mgc --print-ir-after=frontend` (or any pass name).
+Larger schedules replace the straight-line body with `pipeline()`/`systolic()` stages and
+multi-buffered buffers, as in the weight-static example of
+[`systolic`](#systolicn-skew-syncscope-timet).
+
 ## Language
+
+The reference of the `.mgc` constructs. `from mgc import *` at the top of a file makes them
+resolve in editors and linters; mgcc never executes the file.
 
 ### Module level
 
@@ -205,6 +211,10 @@ waiting on an event that was never issued.
 Accelerator operand ranks, parameters (`m, n, k`) and shape constraints come from
 `devices.HWPES`.
 
+Spatz kernels are called from L1 kernels: the C function in `src/kernels.c` offloads the task to
+the tile's Spatz and waits for it (see the attention tests). The kernels themselves live in
+magia-sdk's `kernels/` or in the test's own `kernels/` directory.
+
 L1 kernel operands must be L1 buffers or slots, each declared with a role (`in`, `out`,
 `inout`); the compiler uses the roles to order operations. `params` are expressions over operand
 shapes: `name.shape[i]`, `name.size` (elements) or `name.bytes`. The C function receives the
@@ -260,7 +270,7 @@ the number of stages. With `n = 4` and `S = 3` (load → gemm → store):
 A stage may have several blocks. Since blocks run in textual order, a second `stage(0)` block
 at the end of the body runs at the end of every step: issuing the loads of stage 0 first and
 waiting them last lets them overlap the work of the later stages in between (see
-`tests/magia/mgc/mm_os_l1k` and the systolic example above).
+`tests/magia/mgc/mm_os_l1k` and the weight-static example in [`systolic`](#systolicn-skew-syncscope-timet)).
 
 #### After the loop: `LAST`
 
@@ -457,7 +467,50 @@ for (int t = 0; t < max(skew + n) + S - 2; t++) {   // computed by mgc, same on 
 
 A tile is idle (only taking part in the barriers) for the first `skew` time steps and after its
 `n + S - 2` loop steps are done. The prologue is not delayed by `skew`: it runs on every tile
-before the time loop. A test has at most one `pipeline()` or `systolic()`.
+before the time loop.
+
+Weight-static GEMM (`tests/magia/mgc/mm_ws_mgc/mm_ws.mgc`), complete per-tile code:
+
+```python
+for y_id, x_id in tiles():
+    tile_h = y_id.split(N)
+    tile_w = x_id.split(K)
+    timeslots: u8 = 4
+    t_size: u8 = M // timeslots
+    t_start: u8 = y_id * 2
+
+    w = L1.single_buffer(W[tile_h, tile_w])
+    x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
+    y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
+
+    for z in range(N_ITERATIONS):
+        idma.load(w, W[tile_h, tile_w]).wait()
+        for pt in systolic(timeslots, skew=t_start, sync=GLOBAL):
+            with stage(0):                                # load the blocks of timeslot pt
+                if y_id == 0:
+                    ey = idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
+                ex = idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
+            with stage(2):                                # pass the block on (or store it)
+                if y_id == MESH_Y_TILES - 1:
+                    es = idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
+                else:
+                    es = idma.store(y.at_rel(1, 0)[pt], y[pt])   # same slot, tile below
+            with stage(1):                                # y += x @ w
+                j = redmule.enqueue(x[pt], w, y[pt], op=GEMM)
+                redmule.commit_start()
+            with stage(0):                                # end of the step: wait for all of it
+                if y_id == 0:
+                    ey.wait()
+                ex.wait()
+            with stage(2):
+                es.wait()
+            with stage(1):
+                j.wait()
+
+    sync(COL)
+    if y_id == MESH_Y_TILES - 1:
+        check(Y[:, tile_w], Z[:, tile_w], tol=0x11)
+```
 
 ### Comments
 
@@ -486,57 +539,6 @@ common mistakes. In particular:
   pinned to a loop but used outside it, HWPE
   queues committing the wrong job, and events that are waited on without being issued
   (or reused before the previous transfer/job on it was waited).
-
-### Tiny example
-
-One GEMM per tile, no pipelining (`Y += X @ W`, each tile owns an `M/Y × K/X` block of `Y`):
-
-```python
-from mgc import *
-
-M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")   # from include/test.h
-X = l2("x_inp", (M, N), fp16)
-W = l2("w_inp", (N, K), fp16)
-Y = l2("y_inp", (M, K), fp16)
-
-@test("test_tiny")
-def main():
-    for y_id, x_id in tiles():
-        tile_h = y_id.split(M)                    # rows owned by this tile
-        tile_w = x_id.split(K)                    # columns owned by this tile
-        x = L1.single_buffer(X[tile_h, :])
-        w = L1.single_buffer(W[:, tile_w])
-        y = L1.single_buffer(Y[tile_h, tile_w])
-        idma.load(x, X[tile_h, :])
-        idma.load(w, W[:, tile_w])
-        idma.load(y, Y[tile_h, tile_w]).wait()
-        redmule.gemm(x, w, y)
-        idma.store(Y[tile_h, tile_w], y).wait()
-```
-
-The 14 source lines become about 130 lines of C (excerpt):
-
-```c
-uint32_t len_w     = tile_w * 2;                 // one row of the W block, in bytes
-uint32_t std_w     = K_SIZE * 2;                 // row stride in L2
-uint32_t reps_w    = (uint32_t)N_SIZE;           // number of rows
-uint32_t l1_addr_w = l1_addr_x + (tile_h * N_SIZE * 2);   // L1 layout: x, then w, then y
-uint32_t l2_addr_w = (uint32_t)w_inp + (tile_w_max * x_id * 2);
-...
-mg_idma_memcpy_2d(WAIT_MODE, 0, l2_addr_w, l1_addr_w, len_w, std_w, reps_w, &idma_evt_w, NULL);
-...
-mg_redmule_gemm(WAIT_MODE, l1_addr_x, l1_addr_w, l1_addr_y,
-                (uint16_t)tile_h, (uint16_t)N_SIZE, (uint16_t)tile_w, &redmule_evt, NULL);
-```
-
-The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-idma` turns it into a 2-D
-transfer, while `X[tile_h, :]` is contiguous and stays 1-D. The GEMM dimensions come from the
-buffer shapes, and the `tile_h`/`tile_w` borders handle meshes that do not divide the problem.
-To see the intermediate steps, run `mgcc.py tiny.mgc --print-ir-after=frontend` (or any pass name).
-Larger schedules replace the straight-line body with `pipeline()`/`systolic()` stages and
-multi-buffered buffers, as in the weight-static example above.
-
-### Source map
 
 | File | Content |
 |---|---|
@@ -581,6 +583,61 @@ Extending:
 | a software kernel | `l1_kernel(...)` in the `.mgc` file and the C function |
 | Spatz / PULP offload | an asynchronous executor (needs an mglib layer first) |
 
+## Tests in magia-sdk
+
+All the tests are in `tests/magia/mgc/<dir>`, built as `test_<dir>`, except where noted.
+
+GEMM, compared with the hand-written tests in `tests/magia/mesh`: `mm_os_mglib` and
+`mm_matmul_mglib` on mglib, `mm_ws_2` and `mm_is_2` on the HAL, with the same schedules.
+`*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`.
+
+| Directory | Source | Content |
+|---|---|---|
+| `mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
+| `mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
+| `mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
+| `mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
+| `mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
+
+Attention, `O = softmax(Q @ Kt / sqrt(P)) @ V`, with RedMulE for the matrix products and Spatz for
+the softmax. The golden data come from `tests/magia/mesh/mm_generator/flat_attn.py` (bit-true
+FlatAttention) or the test's `gen_golden.py`.
+
+| Directory | Content |
+|---|---|
+| `unfused_attn` | baseline: three named pipelines in a row (Q @ Kt, row softmax, attn @ V), each through L2, each step's buffers pinned to its loop so that the steps share L1 |
+| `flat_attn_naive` | FlatAttention, one group over the whole mesh, no pipelining |
+| `flat_attn_pipe` | K/V blocks in a software pipeline |
+| `flat_attn_pipeopt` | merged softmax kernels (in the test's `kernels/`), RedMulE jobs enqueued before their Spatz inputs, K/V transfers spread over the step, hot Spatz tasks first in the I$ |
+| `flat_attn_pipeopt2` | the Q loop folded into the K/V pipeline |
+| `flat_attn_pipeopt3` | faster softmax on Spatz, tree multicast of Q/Kt/V |
+| `mhsa_pipeopt3` | multi-head self-attention with the Q/Kt/V/output projections, four steps through L2, the attention as `flat_attn_pipeopt3`, projection and attention buffers sharing L1 |
+| `gqa_pipeopt3` | grouped-query attention (`HKV` K/V heads for `H` Q heads), as `mhsa_pipeopt3` |
+| `mhsa_pipeopt3_masked`, `gqa_pipeopt3_masked` | the same with an additive attention mask |
+
+## Sweeps: `scripts/`
+
+`scripts/mgc_sweep.py` runs the tests over a sweep of mesh sizes and problem sizes on gvsoc and
+compares cycles, MAC/cycle and the utilization of RedMulE, iDMA and Spatz. Sizes other than a
+test's defaults regenerate its `include/test.h` (golden generators) and `src/test.c` (mgcc) in
+place; the sources are restored at the end. Cycles are counted from tile 0's entry in `main`, not
+from the crt0 init.
+
+```sh
+mgc/scripts/mgc_sweep.py --list
+mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 --S 512 1024
+mgc/scripts/mgc_sweep.py --sweep mgc/scripts/mgc_sweep_example.json --jobs 4 --no-profile
+```
+
+Results go to `mgc_sweep/<run>/` in magia-sdk: `summary.log`, `results.csv` and the per-run logs.
+`--jobs` runs gvsoc in parallel on the same mesh side, `--no-profile` keeps only a few busy bits
+per tile in the trace, `--l2-size` runs with a larger L2 for the large layers. The full options
+and metrics are in the script's docstring (`--help`). It needs the `perfetto` Python package,
+torch for the golden generators and the mgc venv for mgcc.
+
+`llama_ffn.py` and `smolvla.py` extrapolate a Llama 3 FFN and a SmolVLA inference from the
+`results.csv` of the layer-shape sweeps listed in their docstrings.
+
 ## Results
 
 2×2 mesh, gvsoc. Exit cycle of each tile, sorted. Every test reports 0 errors.
@@ -590,7 +647,9 @@ Extending:
 > generated by the earlier early-enqueue template gives 355888 / 355903 / 391194 / 391209 (OS),
 > 247466 / 247500 / 528967 / 594869 (WS), 245423 / 245431 / 583806 / 583814 (IS) and
 > 466622 / 466635 / 506299 / 506303 (L1 kernel). The WS/IS rows are therefore not comparable with
-> the reference rows, which were measured on an earlier setup and have not been re-run.
+> the reference rows, which were measured on an earlier setup and have not been re-run. The
+> `mm_ws_mglib` and `mm_is_mglib` references, mglib ports of `mm_ws_2` and `mm_is_2`, are no longer
+> in magia-sdk.
 
 | Test | Cycles |
 |---|---|
@@ -624,9 +683,10 @@ Extending:
 
 - One `tiles()` loop per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
 - fp16 only; RedMulE (GEMM and MATMUL) is the only HWPE accelerator described.
-- L1 kernels run only on the CV32 control core.
+- L1 kernels run only on the CV32 control core; Spatz tasks are offloaded, and waited, from there.
 - No L1 capacity check (tile sizes are run-time values); `pin=` lets the loops of a test share L1.
 - The event check accepts code that is valid on at least one path, so it can miss errors that
   depend on correlated conditions.
-- Multicasts are lowered to unicast transfers. On a 1-wide row/column nothing is transferred, so
-  waiting on the multicast's event is invalid there.
+- Only row/column multicasts of 1-D blocks are native; the others are lowered to unicast
+  transfers. On a 1-wide row/column nothing is transferred, so waiting on the multicast's event
+  is invalid there.
