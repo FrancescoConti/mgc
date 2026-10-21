@@ -28,15 +28,15 @@ tile). A shape not measured is costed linearly in rows x cols from the measured 
 or more sizes, proportional with one). Ops with no data are listed and not counted. Pixel shuffle is
 not counted. See smolvla_pending.txt for the runs.
 
-    tests/magia/mgc/scripts/mgc_sweep.py --tests mm_os_mgc --tiles <N> --M 64 --N 768 --K 320 960 2048 ...
+    mgc/scripts/mgc_sweep.py --tests mm_os_mgc --tiles <N> --M 64 --N 768 --K 320 960 2048 ...
         (M x N x K: 1024 x 768 x 768/3072, 1024 x 3072 x 768, 64 x 12288 x 960, 256 x 960 x 2560,
          256 x 2560 x 960, 256 x 320 x 320, 64 x 768 x 320/960/2048, 64 x 960 x 720, 64 x 2048 x 720;
          T_SIZE=64, --no-profile --l2-size 0x10000000)
-    tests/magia/mgc/scripts/mgc_sweep.py --tests mhsa_pipeopt3 --tiles <N> --S 1024 --D 768 --P 64 --H 12 \
+    mgc/scripts/mgc_sweep.py --tests mhsa_pipeopt3 --tiles <N> --S 1024 --D 768 --P 64 --H 12 \
         --S_BLOCK_SIZE_Q 512 --S_BLOCK_SIZE_KV 256 --no-profile --l2-size 0x10000000
-    tests/magia/mgc/scripts/mgc_sweep.py --tests gqa_pipeopt3[_masked] --tiles <N> --S 256 --D 960 --P 64 --H 15 \
+    mgc/scripts/mgc_sweep.py --tests gqa_pipeopt3[_masked] --tiles <N> --S 256 --D 960 --P 64 --H 15 \
         --HKV 5 --S_BLOCK_SIZE_Q 256 --S_BLOCK_SIZE_KV 256 --no-profile --l2-size 0x10000000
-    tests/magia/mgc/scripts/smolvla.py mgc_sweep/<run>/results.csv [...] [--ops ops.csv [...]]
+    mgc/scripts/smolvla.py mgc_sweep/<run>/results.csv [...] [--ops ops.csv [...]]
 """
 import argparse
 import csv

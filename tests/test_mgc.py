@@ -13,8 +13,10 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.dirname(HERE))
+MGC = os.path.dirname(HERE)
+# magia-sdk checkout: $MAGIA_SDK, or the parent of mgc (a submodule of magia-sdk)
+REPO = os.path.abspath(os.environ.get('MAGIA_SDK', os.path.join(MGC, '..')))
+sys.path.insert(0, MGC)
 
 from mgc import devices  # noqa: E402
 from mgc.driver import compile_module, compile_source, print_ir  # noqa: E402
@@ -62,7 +64,7 @@ class Golden(unittest.TestCase):
     def check(self, d, name):
         if _clang_format() is None:
             self.skipTest('clang-format not available')
-        out = subprocess.run([sys.executable, os.path.join(REPO, 'mgc', 'mgcc.py'), os.path.join(d, name)],
+        out = subprocess.run([sys.executable, os.path.join(MGC, 'mgcc.py'), os.path.join(d, name)],
                              capture_output=True, text=True, check=True).stdout
         self.assertEqual(out, _read(d, os.path.join('src', 'test.c')))
 

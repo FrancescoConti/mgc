@@ -38,15 +38,15 @@ parameters take each test's default), e.g.
       {"tests": ["flat_attn_pipeopt3"], "tiles": [4], "S_BLOCK_SIZE_KV": [256, 512]}
     ]}
 or a single group from the command line:
-    tests/magia/mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
-    tests/magia/mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
-                                         [--no-profile] [--timeout SEC] [--l2-size BYTES]
+    mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
+    mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
+                             [--no-profile] [--timeout SEC] [--l2-size BYTES]
 --no-profile still runs make run_profiling, but gvsoc2perfetto reduces the trace to 5 bits per tile
 (CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in main: VFU% is N/A, and each run's
 (small) perfetto trace is kept in runs/<id>/. --timeout kills a simulation that does not end
 (status TIMEOUT). --l2-size builds and runs gvsoc with a larger L2 (make l2_size=...), needed by tests whose
 golden generator places the L2 arrays in .l2ext (see targets/magia/link.ld).
-    tests/magia/mgc/scripts/mgc_sweep.py --list
+    mgc/scripts/mgc_sweep.py --list
 
 Output in --out: summary.log (human-readable table), results.csv (one row per run, plain
 comma-separated numbers, empty for N/A: Excel, or numpy.genfromtxt(f, delimiter=',',
@@ -57,6 +57,7 @@ Needs the `perfetto` Python package (pip install perfetto; on hosts with glibc <
 trace_processor_shell does not run, and the sweep fetches perfetto v47.0's instead, or give one
 with --trace-processor); the golden generators need torch
 (--gen-python), mgcc needs xDSL (mgc/.venv, see mgc/README.md).
+Run it from anywhere: the magia-sdk checkout is $MAGIA_SDK, or the parent of this mgc checkout.
 """
 
 import argparse
@@ -80,7 +81,9 @@ from queue import Queue
 
 import numpy as np
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+MGC = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# magia-sdk checkout: $MAGIA_SDK, or the parent of mgc (a submodule of magia-sdk)
+REPO = os.path.abspath(os.environ.get('MAGIA_SDK', os.path.join(MGC, '..')))
 MGC_TESTS = os.path.join(REPO, 'tests', 'magia', 'mgc')
 FLAT_GEN = os.path.join(REPO, 'tests', 'magia', 'mesh', 'mm_generator', 'flat_attn.py')
 SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
@@ -337,7 +340,7 @@ def generate(test, cfg, tiles, args, srcs, log):
         if cfg[p] is not None:
             src = re.sub(r'^(%s\s*=\s*define\()\d+(\))' % p, r'\g<1>%d\2' % cfg[p], src, flags=re.M)
     write(test.mgc, src)
-    r = subprocess.run([args.mgcc_python, os.path.join(REPO, 'mgc', 'mgcc.py'), test.mgc, '-o', test.test_c],
+    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '-o', test.test_c],
                        cwd=REPO, capture_output=True, text=True)
     if r.returncode:
         return 'mgcc failed: ' + ' '.join(r.stderr.split())[:200]
@@ -773,8 +776,8 @@ def main():
     ap.add_argument('--cache', default=os.path.join(SWEEP_DIR, 'cache'),
                     help='cache of generated test.h (default: %(default)s)')
     ap.add_argument('--gen-python', default='python3', help='Python with torch for the golden generators')
-    ap.add_argument('--mgcc-python', default=os.path.join(REPO, 'mgc', '.venv', 'bin', 'python')
-                    if os.path.exists(os.path.join(REPO, 'mgc', '.venv', 'bin', 'python')) else 'python3',
+    ap.add_argument('--mgcc-python', default=os.path.join(MGC, '.venv', 'bin', 'python')
+                    if os.path.exists(os.path.join(MGC, '.venv', 'bin', 'python')) else 'python3',
                     help='Python with xDSL for mgcc (default: %(default)s)')
     ap.add_argument('--jobs', '-j', type=int, default=1,
                     help='gvsoc simulations of the same mesh side to run in parallel (default: 1)')

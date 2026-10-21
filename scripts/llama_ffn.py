@@ -15,9 +15,9 @@ the mean steady-state efficiency of the other shapes of the same mesh side.
 The attention block (real GQA, best S_BLOCK config, ms per layer at 1 GHz) is taken from the
 mhsa_pipeopt3 sweeps, scaled to Hq > Hkv (see ATT).
 
-    tests/magia/mgc/scripts/mgc_sweep.py --tests mm_os_mgc --tiles 8 --M 512 --N 256 512 \\
+    mgc/scripts/mgc_sweep.py --tests mm_os_mgc --tiles 8 --M 512 --N 256 512 \\
         --K 2048 3072 4096 8192 13312 14336 16384 --T_SIZE 64 --no-profile --l2-size 0x10000000
-    tests/magia/mgc/scripts/llama_ffn.py mgc_sweep/<run>/results.csv [...]
+    mgc/scripts/llama_ffn.py mgc_sweep/<run>/results.csv [...]
 """
 
 import csv

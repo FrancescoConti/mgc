@@ -5,7 +5,7 @@
 # Francesco Conti <f.conti@unibo.it>
 """The `mg` dialect (xDSL).
 
-Design choices (see ../README.md, "Compiler architecture"):
+Design choices (see ../README.md, "Compiler"):
 
 * Control flow, L1 buffers and operations are IR; integer *index arithmetic*
   is kept as symbolic expressions (`#mg.expr`, see expr.py) over C-level names
