@@ -131,3 +131,11 @@ EXECUTORS = ('CORE',)
 
 # Synchronization scopes -> fsync calls
 SYNC = {'GLOBAL': 'fsync_sync_global', 'ROW': 'fsync_sync_row', 'COL': 'fsync_sync_col'}
+
+# ----------------------------------------------------------------------------
+# L1
+# ----------------------------------------------------------------------------
+
+# Bytes of a tile's L1 for the mgc buffers: L1_BASE (0x20000) up to the next tile's
+# L1_TILE_OFFSET (0x100000), see targets/magia/include/addr_map/tile_addr_map.h
+L1_BYTES = 0xE0000

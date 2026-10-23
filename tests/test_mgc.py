@@ -1086,3 +1086,24 @@ def main():
         c = _c(OS, 'x.mgc', src)
         self.assertIn('mg_event_t redmule_evt;', c)
         self.assertNotIn('redmule_evt_', c)
+
+
+class L1Fit(unittest.TestCase):
+    """mgcc --tiles: the L1 buffers of a tile must fit the L1 on the given mesh sides."""
+
+    FA = os.path.join(MESH, 'flat_attn_pipeopt3')
+
+    def _compile(self, blocks, tiles):
+        src = _read(self.FA, 'flat_attn_pipeopt3.mgc')
+        for b in ('S_BLOCK_SIZE_Q  = define(', 'S_BLOCK_SIZE_KV = define('):
+            src = src.replace(b + '512)', b + '%d)' % blocks)
+        compile_module(src, 'x.mgc', _hdr(self.FA), tiles=tiles)
+
+    def test_fits(self):
+        self._compile(512, [2, 4, 8, 16])
+
+    def test_overflow(self):
+        # 2x2 mesh: 512 x 512 fp16 attention blocks in 3 slots, 2235392 bytes
+        with self.assertRaisesRegex(MgcError, r'take 2235392 bytes on a 2x2 mesh'):
+            self._compile(1024, [2])
+        self._compile(1024, [4])

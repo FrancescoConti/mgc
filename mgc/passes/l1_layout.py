@@ -56,7 +56,9 @@ class L1Layout(ModulePass):
 
     Example: buffers `w` (1 slot, 4 KiB) and `x` (2 slots, 2 KiB each) get
     `l1_tile_base`, `l1_addr_w + 4096`, `l1_addr_x_0 + 2048`. Sets `addrs` on
-    each `mg.alloc` and `base` (e.g. `l1_base_s`, the tile below) on each `mg.remote`.
+    each `mg.alloc` and `base` (e.g. `l1_base_s`, the tile below) on each `mg.remote`,
+    and `l1_ends` on the module: the end offsets of the buffers on the largest tile, the
+    L1 footprint being the largest of them.
     """
     name = 'l1-layout'
 
@@ -64,7 +66,9 @@ class L1Layout(ModulePass):
         ts = tensors(module)
         remotes = [o for o in module.walk() if isinstance(o, ir.RemoteOp)]
         uniform = bool(remotes)
-        placed = []  # (loops, end address, ids of the buffers known to lie below its start)
+        # (loops, end address, ids of the buffers known to lie below its start, end offsets from
+        # l1_tile_base on the largest tile: the end is the largest of them)
+        placed = []
         for a in [o for o in module.walk() if isinstance(o, ir.AllocOp)]:
             shp = a.view.data.shape
             if uniform:
@@ -81,14 +85,19 @@ class L1Layout(ModulePass):
                 start = tops[0][1]
             else:
                 start = _max([b[1] for b in tops])
+            starts = {e.c(): e for b in tops for e in b[3]} or {'0': Const(0)}
+            size = product(Const(depth), *[max_sizes(s) for s in a.view.data.shape], Const(esize(a, ts)))
+            ends = [s + size for s in starts.values()]
             addrs = []
             for k in range(depth):
                 slot = f'l1_addr_{a.sym.data}' if depth == 1 else f'l1_addr_{a.sym.data}_{k}'
                 addrs.append(Raw(start))
                 start = f'{slot} + ({nbytes.c()})'
             a.attributes['addrs'] = ir.exprs(addrs)
-            entry = (loops, start, below | {id(b) for b in under})
+            entry = (loops, start, below | {id(b) for b in under}, ends)
             placed.append(entry)
+        # L1 footprint of a tile, checked against the L1 size by the driver (check_l1)
+        module.attributes['l1_ends'] = ir.exprs([e for b in placed for e in b[3]])
         for r in remotes:
             if r.mode.data != 'rel':
                 continue
