@@ -13,8 +13,12 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
+
+from .errors import MgcError
 
 # ----------------------------------------------------------------------------
 # iDMA
@@ -136,6 +140,25 @@ SYNC = {'GLOBAL': 'fsync_sync_global', 'ROW': 'fsync_sync_row', 'COL': 'fsync_sy
 # L1
 # ----------------------------------------------------------------------------
 
-# Bytes of a tile's L1 for the mgc buffers: L1_BASE (0x20000) up to the next tile's
-# L1_TILE_OFFSET (0x100000), see targets/magia/include/addr_map/tile_addr_map.h
-L1_BYTES = 0xE0000
+# Tile address map of the SDK: magia-sdk is $MAGIA_SDK, or the checkout mgc is a submodule of
+TILE_ADDR_MAP = os.path.join('targets', 'magia', 'include', 'addr_map', 'tile_addr_map.h')
+
+
+def sdk_l1_bytes() -> int:
+    """Bytes of a tile's L1 for the mgc buffers, from L1_BASE up to the next tile's L1
+    (L1_TILE_OFFSET) in the SDK's tile address map, e.g. 0x100000 - 0x20000 = 0xE0000.
+    Raises `MgcError` if the map or either macro is not found (then give mgcc --l1-bytes)."""
+    sdk = os.environ.get('MAGIA_SDK', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    path = os.path.abspath(os.path.join(sdk, TILE_ADDR_MAP))
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        raise MgcError(None, f'cannot read the L1 size: {path} not found (set MAGIA_SDK or give --l1-bytes)')
+    v = {}
+    for name in ('L1_BASE', 'L1_TILE_OFFSET'):
+        m = re.search(r'^\s*#define\s+%s\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?' % name, text, re.M)
+        if not m:
+            raise MgcError(None, f'cannot read the L1 size: no numeric {name} in {path} (give --l1-bytes)')
+        v[name] = int(m.group(1), 0)
+    return v['L1_TILE_OFFSET'] - v['L1_BASE']

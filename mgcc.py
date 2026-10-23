@@ -52,6 +52,9 @@ def main():
                     '(default: include/test.h next to the source)')
     ap.add_argument('--tiles', nargs='+', type=int, default=[], metavar='N',
                     help='mesh sides (make build tiles=N) on which to check that the L1 buffers of a tile fit')
+    ap.add_argument('--l1-bytes', type=lambda x: int(x, 0), metavar='BYTES',
+                    help='L1 size of a tile for --tiles (default: L1_TILE_OFFSET - L1_BASE from the SDK\'s '
+                         'tile_addr_map.h; an error if it cannot be found)')
     ap.add_argument('--print-ir-after', choices=PASS_NAMES, help='print the IR after this stage and stop')
     ap.add_argument('--print-ir-after-all', action='store_true', help='print the IR after every stage to stderr')
     ap.add_argument('--no-format', action='store_true', help='do not run clang-format on the output')
@@ -65,11 +68,12 @@ def main():
             def dump(name, text):
                 if name == args.print_ir_after:
                     sys.stdout.write(text)
-            compile_module(src, args.source, header, until=args.print_ir_after, dump=dump, tiles=args.tiles)
+            compile_module(src, args.source, header, until=args.print_ir_after, dump=dump, tiles=args.tiles,
+                           l1_bytes=args.l1_bytes)
             return 0
         dump = (lambda name, text: sys.stderr.write(f'// ----- IR after {name}\n{text}')) \
             if args.print_ir_after_all else None
-        c = emit(compile_module(src, args.source, header, dump=dump, tiles=args.tiles), args.source)
+        c = emit(compile_module(src, args.source, header, dump=dump, tiles=args.tiles, l1_bytes=args.l1_bytes), args.source)
     except MgcError as e:
         print(e, file=sys.stderr)
         return 1

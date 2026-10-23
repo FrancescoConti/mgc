@@ -13,7 +13,7 @@ from xdsl.context import Context
 from xdsl.printer import Printer
 
 from . import ir
-from .devices import L1_BYTES
+from .devices import sdk_l1_bytes
 from .emit_c import emit
 from .errors import MgcError
 from .expr import Const
@@ -31,9 +31,10 @@ def print_ir(module) -> str:
     return buf.getvalue() + '\n'
 
 
-def check_l1(module, header, tiles):
-    """Raise `MgcError` if the L1 buffers of a tile do not fit `L1_BYTES` on a `tiles` x `tiles`
-    mesh, for each of the mesh sides `tiles`.
+def check_l1(module, header, tiles, l1_bytes=None):
+    """Raise `MgcError` if the L1 buffers of a tile do not fit `l1_bytes` on a `tiles` x `tiles`
+    mesh, for each of the mesh sides `tiles`. `l1_bytes` None: read from the SDK
+    (`devices.sdk_l1_bytes`, an error if it cannot be found).
 
     The footprint (`l1_ends` from l1-layout) is evaluated with the test header's sizes, the
     numeric `define()`s and the tile-split maxima `h_max = ceil(E / tiles)`. A footprint that
@@ -42,8 +43,10 @@ def check_l1(module, header, tiles):
     Example: `S_BLOCK_SIZE_Q = define(1024)` on a 2 x 2 mesh splits each Q block in 512 rows per
     tile; a 512 x 512 fp16 buffer with 3 slots (1.5 MiB) does not fit the 896 KiB of L1.
     """
-    if 'l1_ends' not in module.attributes:
+    if not tiles or 'l1_ends' not in module.attributes:
         return
+    if l1_bytes is None:
+        l1_bytes = sdk_l1_bytes()
     env = dict(parse_header(header)[0])
     for d in module.walk():
         if isinstance(d, ir.DefineOp):
@@ -64,12 +67,12 @@ def check_l1(module, header, tiles):
         if not vals or None in vals:
             continue
         used = max(vals)
-        if used > L1_BYTES:
+        if used > l1_bytes:
             raise MgcError(None, f'the L1 buffers of a tile take {used} bytes on a {t}x{t} mesh, '
-                                 f'more than the {L1_BYTES} bytes of L1')
+                                 f'more than the {l1_bytes} bytes of L1')
 
 
-def compile_module(src, filename, header=None, until=None, dump=None, tiles=()):
+def compile_module(src, filename, header=None, until=None, dump=None, tiles=(), l1_bytes=None):
     """Run the front-end and the passes (up to and including `until`).
     `dump(name, text)` is called with the IR after each stage.
 
@@ -77,7 +80,8 @@ def compile_module(src, filename, header=None, until=None, dump=None, tiles=()):
     `header` is the test header path (optional), `until` is a stage name from
     `PASS_NAMES` at which to stop (default: run everything), `dump` an optional
     callback receiving `(stage_name, ir_text)`, `tiles` the mesh sides on which the
-    L1 footprint is checked (see `check_l1`; none by default).
+    L1 footprint is checked (see `check_l1`; none by default) and `l1_bytes` the L1 size
+    (None: read from the SDK).
 
     Returns the IR module after the last executed stage. The module is verified
     after each stage. Raises `MgcError` for invalid programs.
@@ -100,14 +104,14 @@ def compile_module(src, filename, header=None, until=None, dump=None, tiles=()):
             dump(p.name, print_ir(module))
         if until == p.name:
             break
-    check_l1(module, header, tiles)
+    check_l1(module, header, tiles, l1_bytes)
     return module
 
 
-def compile_source(src, filename, header=None, tiles=()) -> str:
+def compile_source(src, filename, header=None, tiles=(), l1_bytes=None) -> str:
     """Full compilation: `.mgc` text in, C source text out (unformatted).
 
     Same arguments as `compile_module`. This is what the tests use; `mgcc.py`
     additionally runs clang-format on the result.
     """
-    return emit(compile_module(src, filename, header, tiles=tiles), filename)
+    return emit(compile_module(src, filename, header, tiles=tiles, l1_bytes=l1_bytes), filename)

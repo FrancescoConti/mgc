@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -1093,11 +1094,24 @@ class L1Fit(unittest.TestCase):
 
     FA = os.path.join(MESH, 'flat_attn_pipeopt3')
 
-    def _compile(self, blocks, tiles):
+    def _compile(self, blocks, tiles, l1_bytes=None):
         src = _read(self.FA, 'flat_attn_pipeopt3.mgc')
         for b in ('S_BLOCK_SIZE_Q  = define(', 'S_BLOCK_SIZE_KV = define('):
             src = src.replace(b + '512)', b + '%d)' % blocks)
-        compile_module(src, 'x.mgc', _hdr(self.FA), tiles=tiles)
+        compile_module(src, 'x.mgc', _hdr(self.FA), tiles=tiles, l1_bytes=l1_bytes)
+
+    def _sdk(self, text):
+        """MAGIA_SDK pointing at a fake SDK whose tile address map is `text` (None: no map)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        if text is not None:
+            path = os.path.join(d, devices.TILE_ADDR_MAP)
+            os.makedirs(os.path.dirname(path))
+            with open(path, 'w') as f:
+                f.write(text)
+        env = mock.patch.dict(os.environ, {'MAGIA_SDK': d})
+        env.start()
+        self.addCleanup(env.stop)
 
     def test_fits(self):
         self._compile(512, [2, 4, 8, 16])
@@ -1107,3 +1121,24 @@ class L1Fit(unittest.TestCase):
         with self.assertRaisesRegex(MgcError, r'take 2235392 bytes on a 2x2 mesh'):
             self._compile(1024, [2])
         self._compile(1024, [4])
+
+    def test_sdk_l1_bytes(self):
+        self.assertEqual(devices.sdk_l1_bytes(), 0xE0000)
+        self._sdk('#define L1_BASE        (0x00020000)\n#define L1_TILE_OFFSET (0x00400000)\n')
+        self.assertEqual(devices.sdk_l1_bytes(), 0x3E0000)
+        self._compile(1024, [2])
+
+    def test_explicit_l1_bytes(self):
+        with self.assertRaisesRegex(MgcError, 'more than the 1048576 bytes'):
+            self._compile(1024, [2], l1_bytes=1 << 20)
+        self._compile(1024, [2], l1_bytes=4 << 20)
+
+    def test_no_l1_size(self):
+        self._sdk(None)
+        with self.assertRaisesRegex(MgcError, 'tile_addr_map.h not found'):
+            self._compile(512, [2])
+        self._compile(512, [2], l1_bytes=0xE0000)
+        self._compile(512, [])  # no check, the L1 size is not needed
+        self._sdk('#define L1_BASE (0x00020000)\n')
+        with self.assertRaisesRegex(MgcError, 'no numeric L1_TILE_OFFSET'):
+            self._compile(512, [2])
