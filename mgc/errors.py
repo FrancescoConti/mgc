@@ -22,3 +22,12 @@ class MgcError(Exception):
         self.msg = msg
         loc = f'{MgcError.filename}:{self.lineno}' if self.lineno else MgcError.filename
         super().__init__(f'{loc}: error: {msg}')
+
+
+class MgcWarning(UserWarning):
+    """A user-facing compile warning, issued with `warnings.warn(MgcWarning(msg))`; mgcc prints
+    it as `file.mgc: warning: msg` (the file name as for `MgcError`)."""
+
+    def __init__(self, msg):
+        self.msg = msg
+        super().__init__(f'{MgcError.filename}: warning: {msg}')

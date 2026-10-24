@@ -350,16 +350,19 @@ def generate(test, cfg, tiles, args, srcs, log):
         if cfg[p] is not None:
             src = re.sub(r'^(%s\s*=\s*define\()\d+(\))' % p, r'\g<1>%d\2' % cfg[p], src, flags=re.M)
     write(test.mgc, src)
-    return mgcc(test, tiles, args, test.test_c)
+    return mgcc(test, tiles, args, test.test_c, log)
 
 
-def mgcc(test, tiles, args, out):
+def mgcc(test, tiles, args, out, log):
     """Compile the test's .mgc to `out`, checking that its L1 buffers fit on a `tiles` x `tiles`
-    mesh; the reason it failed, or None."""
+    mesh (its warnings, e.g. buffers it could not size, go to `log`); the reason it failed, or None."""
     r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '-o', out,
                         '--tiles', str(tiles)], cwd=REPO, capture_output=True, text=True)
     if r.returncode:
         return 'mgcc failed: ' + ' '.join(r.stderr.split())[:200]
+    for line in r.stderr.splitlines():
+        if ': warning: ' in line:
+            log('  mgcc ' + line.split(': ', 1)[1])
     return None
 
 
@@ -904,7 +907,7 @@ def main():
             elif why is None:
                 for p in list(srcs.saved):  # back to the committed sources
                     shutil.copy2(srcs.saved[p], p)
-                why = mgcc(t, tiles, args, os.devnull)  # committed test.c: only check that it fits L1
+                why = mgcc(t, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
             if why is None and (tiles, hw) != gvsoc_hw:
                 wait(futures)  # the running jobs use the current gvsoc
                 rep.log('  building gvsoc for tiles=%d%s...' % (tiles, hw_desc(hw)))

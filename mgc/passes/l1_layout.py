@@ -58,7 +58,7 @@ class L1Layout(ModulePass):
     `l1_tile_base`, `l1_addr_w + 4096`, `l1_addr_x_0 + 2048`. Sets `addrs` on
     each `mg.alloc` and `base` (e.g. `l1_base_s`, the tile below) on each `mg.remote`,
     and `l1_ends` on the module: the end offsets of the buffers on the largest tile, the
-    L1 footprint being the largest of them.
+    L1 footprint being the largest of them, and `l1_end_bufs`, the buffer of each.
     """
     name = 'l1-layout'
 
@@ -69,6 +69,7 @@ class L1Layout(ModulePass):
         # (loops, end address, ids of the buffers known to lie below its start, end offsets from
         # l1_tile_base on the largest tile: the end is the largest of them)
         placed = []
+        end_bufs = []  # the buffer of each end offset
         for a in [o for o in module.walk() if isinstance(o, ir.AllocOp)]:
             shp = a.view.data.shape
             if uniform:
@@ -96,8 +97,10 @@ class L1Layout(ModulePass):
             a.attributes['addrs'] = ir.exprs(addrs)
             entry = (loops, start, below | {id(b) for b in under}, ends)
             placed.append(entry)
+            end_bufs += [a.sym.data] * len(ends)
         # L1 footprint of a tile, checked against the L1 size by the driver (check_l1)
         module.attributes['l1_ends'] = ir.exprs([e for b in placed for e in b[3]])
+        module.attributes['l1_end_bufs'] = ir.strs(end_bufs)
         for r in remotes:
             if r.mode.data != 'rel':
                 continue

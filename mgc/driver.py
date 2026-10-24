@@ -8,14 +8,16 @@
 from __future__ import annotations
 
 import io
+import warnings
 
 from xdsl.context import Context
 from xdsl.printer import Printer
 
 from . import ir
-from .devices import sdk_l1_bytes
+from .cexpr import evaluate, object_macros, undefined
+from .devices import sdk_l1_bytes, sdk_macros
 from .emit_c import emit
-from .errors import MgcError
+from .errors import MgcError, MgcWarning
 from .expr import Const
 from .frontend import parse, parse_header
 from .ir import MG
@@ -36,9 +38,12 @@ def check_l1(module, header, tiles, l1_bytes=None):
     mesh, for each of the mesh sides `tiles`. `l1_bytes` None: read from the SDK
     (`devices.sdk_l1_bytes`, an error if it cannot be found).
 
-    The footprint (`l1_ends` from l1-layout) is evaluated with the test header's sizes, the
-    numeric `define()`s and the tile-split maxima `h_max = ceil(E / tiles)`. A footprint that
-    depends on run-time values cannot be checked and is skipped.
+    The footprint (`l1_ends` from l1-layout) is evaluated with the `define()`s, the macros of
+    the test header and of the SDK's tile address map (C expressions too, e.g.
+    `define("(L1_SIZE + 1) / 2")`; see `cexpr`), `MESH_X_TILES = MESH_Y_TILES = tiles` and the
+    tile-split maxima `h_max = ceil(E / tiles)`. Buffers whose size cannot be computed (run-time
+    values, unknown macros) are left out with an `MgcWarning` naming them and the missing
+    values; the others are still checked, a lower bound of the footprint.
 
     Example: `S_BLOCK_SIZE_Q = define(1024)` on a 2 x 2 mesh splits each Q block in 512 rows per
     tile; a 512 x 512 fp16 buffer with 3 slots (1.5 MiB) does not fit the 896 KiB of L1.
@@ -47,29 +52,35 @@ def check_l1(module, header, tiles, l1_bytes=None):
         return
     if l1_bytes is None:
         l1_bytes = sdk_l1_bytes()
-    env = dict(parse_header(header)[0])
+    macros = {**sdk_macros(), **object_macros(parse_header(header)[1])}
     for d in module.walk():
         if isinstance(d, ir.DefineOp):
-            try:
-                env[d.sym.data] = int(d.text.data, 0)
-            except ValueError:
-                pass
+            macros[d.sym.data] = d.text.data
     splits = [s for s in module.walk() if isinstance(s, ir.SplitOp)]
     ends = [e.data for e in module.attributes['l1_ends'].data]
+    bufs = [b.data for b in module.attributes['l1_end_bufs'].data]
+    names = set().union(*(e.syms() for e in ends), *(s.extent.data.syms() for s in splits))
     for t in tiles:
-        m = {k: Const(v) for k, v in env.items()}
-        m['MESH_X_TILES'] = m['MESH_Y_TILES'] = Const(t)
+        mesh = {'MESH_X_TILES': t, 'MESH_Y_TILES': t}
+        m = {k: Const(v) for k, v in ((k, evaluate(k, macros, mesh)) for k in names | set(mesh)) if v is not None}
+        split_of = {}  # tile-split maximum -> the names its extent needs
         for s in splits:
             ext = s.extent.data.subst(m).value()
             if ext is not None:
                 m[s.sym.data + '_max'] = Const((ext + t - 1) // t)
+            split_of[s.sym.data + '_max'] = s.extent.data.syms()
         vals = [e.subst(m).value() for e in ends]
-        if not vals or None in vals:
-            continue
-        used = max(vals)
+        unknown = sorted({b for b, v in zip(bufs, vals) if v is None})
+        used = max((v for v in vals if v is not None), default=0)
         if used > l1_bytes:
-            raise MgcError(None, f'the L1 buffers of a tile take {used} bytes on a {t}x{t} mesh, '
-                                 f'more than the {l1_bytes} bytes of L1')
+            raise MgcError(None, f'the L1 buffers of a tile take {"at least " if unknown else ""}{used} bytes on '
+                                 f'a {t}x{t} mesh, more than the {l1_bytes} bytes of L1')
+        if unknown:
+            need = set().union(*(e.syms() for e, v in zip(ends, vals) if v is None)) - set(m)
+            need = set().union(*(split_of.get(x, {x}) for x in need)) - set(m)
+            missing = sorted(set().union(*(undefined(x, macros, mesh) or {x} for x in need)))
+            warnings.warn(MgcWarning(f'L1 fit on a {t}x{t} mesh checked without {", ".join(f"`{b}`" for b in unknown)}, '
+                                     f'whose size depends on {", ".join(missing)}: not known at compile time'))
 
 
 def compile_module(src, filename, header=None, until=None, dump=None, tiles=(), l1_bytes=None):

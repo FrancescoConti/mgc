@@ -6,6 +6,7 @@
 """mgc compiler tests: mgc/.venv/bin/python -m unittest discover -s mgc/tests"""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,9 +20,9 @@ MGC = os.path.dirname(HERE)
 REPO = os.path.abspath(os.environ.get('MAGIA_SDK', os.path.join(MGC, '..')))
 sys.path.insert(0, MGC)
 
-from mgc import devices  # noqa: E402
+from mgc import cexpr, devices  # noqa: E402
 from mgc.driver import compile_module, compile_source, print_ir  # noqa: E402
-from mgc.errors import MgcError  # noqa: E402
+from mgc.errors import MgcError, MgcWarning  # noqa: E402
 
 MESH = os.path.join(REPO, 'tests', 'magia', 'mgc')
 OS, WS, IS, L1K = (os.path.join(MESH, d) for d in ('mm_os_mgc', 'mm_ws_mgc', 'mm_is_mgc', 'mm_os_l1k'))
@@ -1107,10 +1108,12 @@ class L1Fit(unittest.TestCase):
 
     FA = os.path.join(MESH, 'flat_attn_pipeopt3')
 
-    def _compile(self, blocks, tiles, l1_bytes=None):
+    def _compile(self, blocks, tiles, l1_bytes=None, kv=None):
+        """flat_attn_pipeopt3 with Q and K/V blocks of `blocks` rows (K/V: `kv`, if given): a
+        number or the text of a C expression."""
         src = _read(self.FA, 'flat_attn_pipeopt3.mgc')
-        for b in ('S_BLOCK_SIZE_Q  = define(', 'S_BLOCK_SIZE_KV = define('):
-            src = src.replace(b + '512)', b + '%d)' % blocks)
+        for b, v in (('S_BLOCK_SIZE_Q  = define(', blocks), ('S_BLOCK_SIZE_KV = define(', blocks if kv is None else kv)):
+            src = src.replace(b + '512)', b + (v if isinstance(v, str) else '%d' % v) + ')')
         compile_module(src, 'x.mgc', _hdr(self.FA), tiles=tiles, l1_bytes=l1_bytes)
 
     def _sdk(self, text):
@@ -1155,3 +1158,83 @@ class L1Fit(unittest.TestCase):
         self._sdk('#define L1_BASE (0x00020000)\n')
         with self.assertRaisesRegex(MgcError, 'no numeric L1_TILE_OFFSET'):
             self._compile(512, [2])
+
+    def test_expression_defines(self):
+        # 1024-row blocks from a C expression over the SDK's L1_SIZE (0xDFFFF): as test_overflow
+        with self.assertRaisesRegex(MgcError, r'take 2235392 bytes on a 2x2 mesh'):
+            self._compile('"(L1_SIZE + 1) / 896"', [2])
+        self._compile('"(L1_SIZE + 1) / 896"', [4])
+
+    def test_unknown_size_warns(self):
+        # the K/V block size is not known: the buffers sized by it are left out, with a warning
+        with self.assertWarnsRegex(MgcWarning, r'L1 fit on a 2x2 mesh checked without .*`attn`.*'
+                                               r'whose size depends on UNKNOWN_KV'):
+            self._compile(512, [2], kv='"UNKNOWN_KV"')
+        # the others are still checked: 4096-row Q blocks alone do not fit
+        with self.assertRaisesRegex(MgcError, r'take at least \d+ bytes on a 2x2 mesh'):
+            self._compile(8192, [2], kv='"UNKNOWN_KV"')
+
+    def test_mhsa_projection_blocks(self):
+        # mhsa_pipeopt3 at S=512, D=3072, P=128, H=8: the projection blocks (PROJ_KB_E/HP) are C
+        # expressions over L1_SIZE; with wo pinned to the Flat-Attention loop too, yo lands above it
+        d = os.path.join(MESH, 'mhsa_pipeopt3')
+        hdr = _read(d, os.path.join('include', 'test.h'))
+        for name, v in (('SEQ_LENGTH', 512), ('EMBED_SIZE', 3072), ('PROJ_SIZE', 128), ('NUM_HEADS', 8)):
+            hdr, n = re.subn(r'^(#define %s\s+).*$' % name, r'\g<1>(%d)' % v, hdr, flags=re.M)
+            self.assertEqual(n, 1)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, 'test.h')
+        with open(path, 'w') as f:
+            f.write(hdr)
+        src = _read(d, 'mhsa_pipeopt3.mgc')
+        compile_module(src, 'x.mgc', path, tiles=[4, 8])
+        wo = 'wo = L1.multi_buffer(wo_[0:PROJ_KB_HP, tile_e], pin="o_proj")'
+        self.assertIn(wo, src)
+        src = src.replace(wo, wo.replace('pin="o_proj"', 'pin=("attn", "o_proj")'))
+        with self.assertRaisesRegex(MgcError, r'take 1018112 bytes on a 4x4 mesh'):
+            compile_module(src, 'x.mgc', path, tiles=[4])
+
+
+class CExpr(unittest.TestCase):
+    """cexpr: integer C expressions of #defines, for the L1 check."""
+
+    def ev(self, text, **macros):
+        return cexpr.evaluate(text, {k: str(v) for k, v in macros.items()})
+
+    def test_arithmetic(self):
+        self.assertEqual(self.ev('1 + 2 * 3 - (4 - 1)'), 4)
+        self.assertEqual(self.ev('0x10 + 010 + 0 + 7u + 3UL'), 16 + 8 + 7 + 3)  # 010: octal
+        self.assertEqual(self.ev('-7 / 2'), -3)  # C: truncation toward zero
+        self.assertEqual(self.ev('-7 % 2'), -1)
+        self.assertEqual(self.ev('1 << 4 | 1 & 3 ^ 2'), 19)  # 16 | ((1 & 3) ^ 2)
+        self.assertEqual(self.ev('!0 + ~0'), 0)
+        self.assertIsNone(self.ev('1 / 0'))
+
+    def test_logic_and_conditional(self):
+        self.assertEqual(self.ev('3 > 2 && 2 >= 2 || 0'), 1)
+        self.assertEqual(self.ev('1 == 2 ? 10 : 2 != 2 ? 20 : 30'), 30)
+        # only the operand that is selected must be known
+        self.assertEqual(self.ev('0 && X'), 0)
+        self.assertEqual(self.ev('1 || X'), 1)
+        self.assertEqual(self.ev('1 ? 5 : X'), 5)
+        self.assertIsNone(self.ev('1 && X'))
+        self.assertIsNone(self.ev('X ? 1 : 1'))
+
+    def test_macros(self):
+        self.assertEqual(self.ev('B * 2', A='(3)', B='(A + 1)'), 8)
+        self.assertEqual(cexpr.evaluate('N + A', {'A': 'N * 2'}, {'N': 4}), 12)
+        self.assertIsNone(self.ev('A', A='A + 1'))  # recursive
+        self.assertIsNone(self.ev('F(2)'))  # function-like
+        self.assertIsNone(self.ev('(uint32_t)4'))  # cast
+        self.assertIsNone(self.ev('1 +'))
+
+    def test_object_macros(self):
+        m = cexpr.object_macros('#define A (0x10) // sixteen\n  # define B A /* c */ + \\\n 1\n'
+                                '#define F(x) (x)\n#define E\n')
+        self.assertEqual({k: ' '.join(v.split()) for k, v in m.items()}, {'A': '(0x10)', 'B': 'A + 1', 'E': ''})
+        self.assertEqual(cexpr.evaluate('B', m), 17)
+
+    def test_undefined(self):
+        self.assertEqual(cexpr.undefined('B', {'B': 'A + C * D', 'A': '1', 'D': 'B'}), {'C'})
+        self.assertEqual(cexpr.undefined('B', {'B': 'N'}, {'N': 2}), set())

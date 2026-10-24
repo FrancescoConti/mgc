@@ -18,12 +18,13 @@ import os
 import shutil
 import subprocess
 import sys
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mgc.driver import PASS_NAMES, compile_module  # noqa: E402
 from mgc.emit_c import emit  # noqa: E402
-from mgc.errors import MgcError  # noqa: E402
+from mgc.errors import MgcError, MgcWarning  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -59,6 +60,11 @@ def main():
     ap.add_argument('--print-ir-after-all', action='store_true', help='print the IR after every stage to stderr')
     ap.add_argument('--no-format', action='store_true', help='do not run clang-format on the output')
     args = ap.parse_args()
+    # compile warnings as `file.mgc: warning: msg`, each time they are issued
+    warnings.simplefilter('always', MgcWarning)
+    show = warnings.showwarning
+    warnings.showwarning = lambda msg, cat, *a, **k: (print(msg, file=sys.stderr) if issubclass(cat, MgcWarning)
+                                                      else show(msg, cat, *a, **k))
 
     with open(args.source) as f:
         src = f.read()

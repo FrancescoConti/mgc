@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
+from .cexpr import object_macros
 from .errors import MgcError
 
 # ----------------------------------------------------------------------------
@@ -144,12 +145,26 @@ SYNC = {'GLOBAL': 'fsync_sync_global', 'ROW': 'fsync_sync_row', 'COL': 'fsync_sy
 TILE_ADDR_MAP = os.path.join('targets', 'magia', 'include', 'addr_map', 'tile_addr_map.h')
 
 
+def _tile_addr_map() -> str:
+    sdk = os.environ.get('MAGIA_SDK', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    return os.path.abspath(os.path.join(sdk, TILE_ADDR_MAP))
+
+
+def sdk_macros() -> dict:
+    """The object-like macros of the SDK's tile address map (e.g. `L1_SIZE -> '(0x000DFFFF)'`),
+    which the `define()`s of a test may use; {} if the map is not found."""
+    try:
+        with open(_tile_addr_map()) as f:
+            return object_macros(f.read())
+    except OSError:
+        return {}
+
+
 def sdk_l1_bytes() -> int:
     """Bytes of a tile's L1 for the mgc buffers, from L1_BASE up to the next tile's L1
     (L1_TILE_OFFSET) in the SDK's tile address map, e.g. 0x100000 - 0x20000 = 0xE0000.
     Raises `MgcError` if the map or either macro is not found (then give mgcc --l1-bytes)."""
-    sdk = os.environ.get('MAGIA_SDK', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
-    path = os.path.abspath(os.path.join(sdk, TILE_ADDR_MAP))
+    path = _tile_addr_map()
     try:
         with open(path) as f:
             text = f.read()
