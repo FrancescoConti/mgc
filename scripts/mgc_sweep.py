@@ -39,15 +39,18 @@ parameters take each test's default), e.g.
     ]}
 or a single group from the command line:
     mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
-    mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
+    mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--full-traces]
                              [--no-profile] [--timeout SEC] [--l2-size BYTES]
 Hardware: spatz_vlen (bits) and redmule ('HxW') sweep the gvsoc Spatz VLEN and RedMulE array
 (make spatz_vlen=... redmule_h=... redmule_w=...; default: gvsoc's, 256 and 8x8), e.g.
     mgc/scripts/mgc_sweep.py --tests flat_attn_pipeopt3 --spatz-vlen 256 512 --redmule 8x8 16x16
 gvsoc is rebuilt for each (mesh side, hardware).
---no-profile still runs make run_profiling, but gvsoc2perfetto reduces the trace to 5 bits per tile
-(CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in main: VFU% is N/A, and each run's
-(small) perfetto trace is kept in runs/<id>/. --timeout kills a simulation that does not end
+Traces: by default make run_profiling dumps only the events the sweep measures, and gvsoc2perfetto
+reduces them to 5 bits per tile (CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in
+main: VFU% is N/A, and each run's (small) perfetto trace is kept in runs/<id>/. --full-traces dumps
+all of make's profile events instead (VFU% measured; the traces, kept in runs/<id>/, can be GBs).
+--no-profile runs make run, without any trace: only status, errors and end_cycle (the exit of the
+last tile other than tile 0, from reset, crt0 init included). --timeout kills a simulation that does not end
 (status TIMEOUT). --l2-size builds and runs gvsoc with a larger L2 (make l2_size=...), needed by tests whose
 golden generator places the L2 arrays in .l2ext (see targets/magia/link.ld).
     mgc/scripts/mgc_sweep.py --list
@@ -109,7 +112,7 @@ PROFILE_EVENTS = ["'/tile-0-cv32-core/active_pc$$'"] + ["'/tile-[0-9]*-%s$$'" % 
 PERFETTO_INCLUDE = (r'(?x) tile-\d+-cv32-core\.(busy|active_pc)$$ | tile-\d+-redmule\.busy$$'
                     r' | tile-\d+-idma-(axi2obi|obi2axi)\.be\.busy$$'
                     r' | tile-\d+-snitch-spatz\.(active_pc|ara\.active)$$')
-# --no-profile: the same events, reduced by gvsoc2perfetto to tile 0's main marker (cv32-core.main)
+# default (light) traces: the same events, reduced by gvsoc2perfetto to tile 0's main marker (cv32-core.main)
 # and one busy bit per unit; Spatz busy (spatz_busy) = Snitch PC in a task | VFU active
 LIGHT_KEEP = (r'(?x) cv32-core\.(busy|main)$$ | redmule\.busy$$ | idma-(axi2obi|obi2axi)\.be\.busy$$'
               r' | snitch-spatz\.spatz_busy$$')
@@ -442,10 +445,10 @@ def build_test(test, tiles, build, logf):
 
 
 def run_test(test, tiles, hw, build, work, logf, args):
-    cmd = ('make run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s%s'
-           % (tiles, test.target, build, work, gvsoc_opts(args, hw)))
+    cmd = ('make %s platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s%s'
+           % ('run' if args.no_profile else 'run_profiling', tiles, test.target, build, work, gvsoc_opts(args, hw)))
     env = {}
-    if args.no_profile:  # through the environment: the Makefile's ?= defaults give way
+    if not args.no_profile and not args.full_traces:  # through the environment: the Makefile's ?= defaults give way
         main = symbols(test, build)['main']
         extra = ['--pc-in', r'tile-0-cv32-core\.active_pc$$=main:%x-%x' % (main, main + 1)]
         if test.spatz_name:
@@ -454,9 +457,6 @@ def run_test(test, tiles, hw, build, work, logf, args):
         extra += ['--or', 'spatz_busy=task,ara.active', '--keep', LIGHT_KEEP]
         env = {'profile_events': ' '.join(PROFILE_EVENTS), 'GVSOC2PERFETTO_INCLUDE': PERFETTO_INCLUDE,
                'GVSOC2PERFETTO_EXTRA': ' '.join(map(shlex.quote, extra))}
-    elif not args.keep_traces:
-        cmd += ' ' + shlex.quote('profile_events=' + ' '.join(PROFILE_EVENTS))
-        cmd += ' ' + shlex.quote('GVSOC2PERFETTO_INCLUDE=' + PERFETTO_INCLUDE)
     rc, out = make(cmd, args.timeout, env)
     with open(logf, 'a') as f:
         f.write(''.join('$ export %s=%s\n' % (k, shlex.quote(v)) for k, v in env.items()))
@@ -752,13 +752,19 @@ def simulate(t, cfg, tiles, hw, row, rdir, slot, build, work, t0, tag, args, rep
             row['status'] = 'BUILD/RUN FAIL' if rc else 'NO EXIT'
             rep.log('%s %s (rc=%d, %d/%d tiles exited), see %s' % (tag, row['status'], rc, len(kills),
                                                                  tiles * tiles, rdir))
+        elif args.no_profile:
+            row['status'] = 'PASS' if errs and sum(errs) == 0 else 'FAIL'
+            row['end_cycle'] = max(c for k, c in kills.items() if k != 0 or tiles == 1)
+            rep.log('%s %s: ends at cycle %s from reset (%.1fs)' % (tag, row['status'], format(row['end_cycle'], ','),
+                                                                    time.time() - t0))
         else:
             row['status'] = 'PASS' if errs and sum(errs) == 0 else 'FAIL'
             trace = os.path.join(work, 'trace.perfetto-trace')
-            lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build, args.no_profile, args.trace_processor)
+            light = not args.full_traces
+            lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build, light, args.trace_processor)
             cyc = hi - lo
             macs = t.macs(cfg)
-            if args.no_profile:  # Spatz busy only, no VFU
+            if light:  # Spatz busy only, no VFU
                 for pt in per_tile:
                     del pt['vfu']
             mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
@@ -783,9 +789,9 @@ def simulate(t, cfg, tiles, hw, row, rdir, slot, build, work, t0, tag, args, rep
         row['status'] = 'ANALYSIS FAIL'
         rep.log('%s analysis failed: %r' % (tag, e))
     finally:
-        # traces are GBs: keep them only if asked or light (the VCD is left behind by a failed run)
+        # keep the trace (the VCD is left behind by a failed run)
         trace = os.path.join(work, 'trace.perfetto-trace')
-        if (args.keep_traces or args.no_profile) and os.path.exists(trace) and not STOP.is_set():
+        if os.path.exists(trace) and not STOP.is_set():
             shutil.move(trace, rdir)
         for f in (trace, os.path.join(work, 'all.vcd')):
             if os.path.exists(f):
@@ -818,13 +824,12 @@ def main():
                     help='Python with xDSL for mgcc (default: %(default)s)')
     ap.add_argument('--jobs', '-j', type=int, default=1,
                     help='gvsoc simulations of the same mesh side to run in parallel (default: 1)')
-    ap.add_argument('--keep-traces', action='store_true',
-                    help='keep each run\'s perfetto trace, with all of make\'s profile events (default: '
-                         'only the events the sweep measures, trace deleted after the analysis)')
+    ap.add_argument('--full-traces', action='store_true',
+                    help='trace all of make\'s profile events, VFU%% included (default: only the events the sweep '
+                         'measures, reduced to 5 busy bits per tile and tile 0\'s entry in main, VFU%% N/A); '
+                         'the perfetto trace is kept in runs/<id>/ either way')
     ap.add_argument('--no-profile', action='store_true',
-                    help='make run_profiling with the trace reduced (through the environment) to 5 busy bits '
-                         'per tile and tile 0\'s entry in main: VFU%% N/A, the small perfetto trace is kept '
-                         'in runs/<id>/')
+                    help='make run, without any trace: only status, errors and end_cycle (from reset)')
     ap.add_argument('--timeout', type=int, help='kill a simulation after this many seconds (status TIMEOUT)')
     ap.add_argument('--l2-size', help='gvsoc L2 size (make l2_size=..., e.g. 0x10000000), for tests with data in '
                     '.l2ext above the default L2 (mhsa/gqa_pipeopt3 with more than 12 MiB of L2 arrays)')
@@ -872,8 +877,8 @@ def main():
     srcs = Sources(rep.log)
     signal.signal(signal.SIGTERM, on_sigterm)
     rep.log('mgc sweep: %d configurations, output in %s' % (len(runs), out))
-    if args.no_profile and args.keep_traces:
-        ap.error('--no-profile and --keep-traces are exclusive')
+    if args.no_profile and args.full_traces:
+        ap.error('--no-profile and --full-traces are exclusive')
     args.trace_processor = trace_processor_bin(args.trace_processor, rep.log)
 
     pool = ThreadPoolExecutor(args.jobs)

@@ -16,7 +16,7 @@ The attention block (real GQA, best S_BLOCK config, ms per layer at 1 GHz) is ta
 mhsa_pipeopt3 sweeps, scaled to Hq > Hkv (see ATT).
 
     mgc/scripts/mgc_sweep.py --tests mm_os_mgc --tiles 8 --M 512 --N 256 512 \\
-        --K 2048 3072 4096 8192 13312 14336 16384 --T_SIZE 64 --no-profile --l2-size 0x10000000
+        --K 2048 3072 4096 8192 13312 14336 16384 --T_SIZE 64 --l2-size 0x10000000
     mgc/scripts/llama_ffn.py mgc_sweep/<run>/results.csv [...]
 """
 

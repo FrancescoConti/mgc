@@ -626,12 +626,14 @@ from the crt0 init.
 ```sh
 mgc/scripts/mgc_sweep.py --list
 mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 --S 512 1024
-mgc/scripts/mgc_sweep.py --sweep mgc/scripts/mgc_sweep_example.json --jobs 4 --no-profile
+mgc/scripts/mgc_sweep.py --sweep mgc/scripts/mgc_sweep_example.json --jobs 4
 ```
 
 Results go to `mgc_sweep/<run>/` in magia-sdk: `summary.log`, `results.csv` and the per-run logs.
-`--jobs` runs gvsoc in parallel on the same mesh side, `--no-profile` keeps only a few busy bits
-per tile in the trace, `--l2-size` runs with a larger L2 for the large layers. The full options
+Each run keeps a small perfetto trace (a few busy bits per tile) in `runs/<id>/`; `--full-traces`
+keeps all of the profile events instead (Spatz VFU included, GBs), and `--no-profile` runs without
+any trace (status, errors and end cycle only). `--jobs` runs gvsoc in parallel on the same mesh
+side, `--l2-size` runs with a larger L2 for the large layers. The full options
 and metrics are in the script's docstring (`--help`). It needs the `perfetto` Python package,
 torch for the golden generators and the mgc venv for mgcc.
 
