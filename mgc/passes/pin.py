@@ -116,6 +116,10 @@ class PinCheck(ModulePass):
             if _issues(op):
                 key = _evkey(op.event.data)
                 w = next((x for x in ops[n + 1:] if isinstance(x, ir.WaitOp) and _evkey(x.event.data) == key), None)
+                if w is None:
+                    # in a pipeline(), a later stage's wait may be written before the issue
+                    w = next((x for x in reversed(ops[:n]) if isinstance(x, ir.WaitOp)
+                              and _evkey(x.event.data) == key and where(x) == ps[0]), None)
                 ps.append(where(w) if w is not None else len(top))
             for a in mine:
                 uses[id(a)] += [(p, op) for p in ps]

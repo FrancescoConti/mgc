@@ -983,6 +983,19 @@ def main():
                            '                ec.wait()\n        idma.load(a[0], X[0:t_size, :]).wait()\n')],
                          '`a` is pinned to "one" but used (or waited) outside')
 
+    def test_wait_written_before_issue(self):
+        # the stage(1) wait of job i - 1 written before the stage(0) enqueue of job i
+        self.c(('        idma.load(w, W[:, tile_w]).wait()\n',
+                '        y = L1.single_buffer(Y[0:t_size, tile_w])\n'
+                '        ev = redmule.events()\n'
+                '        idma.load(w, W[:, tile_w]).wait()\n'),
+               ('            with stage(1):\n                ea.wait()\n',
+                '            with stage(1):\n                ev[i].wait()\n'
+                '            with stage(0):\n'
+                '                redmule.enqueue(a[i], w, y, op=GEMM, event=ev[i])\n'
+                '                ea.wait()\n'
+                '                redmule.commit_start()\n'))
+
     def test_between_loops(self):
         # b (from loop two) used before the last use of a (up to loop one), between the two loops
         self.assertError([('        for i in pipeline(steps, name="two"):\n',
