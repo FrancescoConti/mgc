@@ -42,9 +42,14 @@ or a single group from the command line:
     mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--full-traces]
                              [--no-profile] [--timeout SEC] [--l2-size BYTES]
 Hardware: spatz_vlen (bits) and redmule ('HxW') sweep the gvsoc Spatz VLEN and RedMulE array
-(make spatz_vlen=... redmule_h=... redmule_w=...; default: gvsoc's, 256 and 8x8), e.g.
+(default: gvsoc's, 256 and 8x8), e.g.
     mgc/scripts/mgc_sweep.py --tests flat_attn_pipeopt3 --spatz-vlen 256 512 --redmule 8x8 16x16
-gvsoc is rebuilt for each (mesh side, hardware).
+The default hardware runs on gvsoc/, rebuilt for each mesh side once the runs on it are over. Any other
+(mesh side, hardware) runs on its own copy of gvsoc, <cache>/gvsoc/tiles<N>[_<hw>]/ (the gvsoc sources
+without build/ and install/, synced at each sweep, with the Spatz VLEN and the RedMulE array set in the
+copy's pulp/pulp/chips/magia_v3/tile.py; the RedMulE TCDM port scales with the height), built once per
+sweep (incrementally after the first) and passed to make as GVSOC_DIR: runs on different gvsoc
+parametrizations then share the --jobs slots. gvsoc/ itself is never modified by the hardware knobs.
 Traces: by default make run_profiling dumps only the events the sweep measures, and gvsoc2perfetto
 reduces them to 5 bits per tile (CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in
 main: VFU% is N/A, and each run's (small) perfetto trace is kept in runs/<id>/. --full-traces dumps
@@ -94,6 +99,7 @@ REPO = os.path.abspath(os.environ.get('MAGIA_SDK', os.path.join(MGC, '..')))
 MGC_TESTS = os.path.join(REPO, 'tests', 'magia', 'mgc')
 FLAT_GEN = os.path.join(REPO, 'tests', 'magia', 'mesh', 'mm_generator', 'flat_attn.py')
 SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
+GVSOC = os.path.join(REPO, 'gvsoc')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
@@ -410,13 +416,12 @@ def slot_dirs(out, slot):
     return os.path.join(d, 'build'), os.path.join(d, 'gvsoc_work')
 
 
-def gvsoc_opts(args, hw):
-    """make options for the gvsoc target: L2 size (--l2-size) and hardware knobs, or ''."""
+def gvsoc_opts(args, tiles, hw):
+    """make options for the gvsoc target: L2 size (--l2-size) and the gvsoc copy of the hardware, or ''."""
     opts = ' l2_size=%s' % args.l2_size if args.l2_size else ''
-    if hw['spatz_vlen']:
-        opts += ' spatz_vlen=%d' % hw['spatz_vlen']
-    if hw['redmule']:
-        opts += ' redmule_h=%d redmule_w=%d' % redmule_hw(hw['redmule'])
+    gdir = gvsoc_dir(tiles, hw, args)
+    if gdir != GVSOC:
+        opts += ' GVSOC_DIR=%s' % gdir
     return opts
 
 
@@ -430,10 +435,59 @@ def hw_desc(hw):
     return ''.join(' %s=%s' % (p, hw[p]) for p in HW_PARAMS if hw[p])
 
 
+# hardware knobs in the copies of gvsoc: (regex of the line in tile.py, replacement), one match each
+TILE_PY = os.path.join('pulp', 'pulp', 'chips', 'magia_v3', 'tile.py')
+TILE_KNOBS = {
+    'spatz_vlen': [(r'\bvlen=\d+(?=, nb_ipus=)', lambda v: 'vlen=%d' % v)],
+    'redmule': [(r'(?m)^(\s*tcdm_bank_number\s*=\s*)\d+', lambda v: r'\g<1>%d' % redmule_hw(v)[0]),
+                (r'(?m)^(\s*ce_height\s*=\s*)\d+', lambda v: r'\g<1>%d' % redmule_hw(v)[0]),
+                (r'(?m)^(\s*ce_width\s*=\s*)\d+', lambda v: r'\g<1>%d' % redmule_hw(v)[1])],
+}
+
+
+def gvsoc_dir(tiles, hw, args):
+    """The gvsoc tree of a mesh side and hardware: gvsoc/ for the default hardware, else its copy."""
+    if not any(hw[p] for p in HW_PARAMS):
+        return GVSOC
+    return os.path.join(args.cache, 'gvsoc', 'tiles%d%s' % (tiles, hw_desc(hw).replace(' ', '_').replace('=', '')))
+
+
+def tile_py(hw):
+    """gvsoc's magia_v3 tile.py with the hardware knobs of `hw` set."""
+    with open(os.path.join(GVSOC, TILE_PY)) as f:
+        text = f.read()
+    for p in HW_PARAMS:
+        if hw[p]:
+            for pat, repl in TILE_KNOBS[p]:
+                text, n = re.subn(pat, repl(hw[p]), text)
+                if n != 1:
+                    raise RuntimeError('%s: %d matches of %s for %s=%s' % (TILE_PY, n, pat, p, hw[p]))
+    return text
+
+
+def sync_gvsoc_copy(gdir, hw):
+    """Bring the copy `gdir` of gvsoc up to date with gvsoc/ (sources only: its own build/ and install/
+    are kept) and set its hardware in tile.py; files are only rewritten if they change, so that the
+    build of the copy stays incremental."""
+    os.makedirs(gdir, exist_ok=True)
+    subprocess.run(['rsync', '-a', '--delete', '--exclude=/build/', '--exclude=/install/',
+                    '--exclude=/' + TILE_PY, GVSOC + '/', gdir + '/'], check=True)
+    text, path = tile_py(hw), os.path.join(gdir, TILE_PY)
+    if not os.path.exists(path) or open(path).read() != text:
+        write(path, text)
+
+
 def build_gvsoc(tiles, hw, logf, args):
-    """gvsoc is built for one mesh side and hardware: rebuild it whenever they change."""
+    """Build the gvsoc tree of a mesh side and hardware (gvsoc/, or a copy synced first)."""
+    gdir = gvsoc_dir(tiles, hw, args)
+    if gdir != GVSOC:
+        try:
+            sync_gvsoc_copy(gdir, hw)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as e:
+            write(logf, 'cannot prepare the gvsoc copy %s: %s\n' % (gdir, e))
+            return 1
     # gvsoc2perfetto too, so that parallel run_profiling do not race to build it
-    cmd = 'make gvsoc tiles=%d pulp_cluster=0%s && make gvsoc2perfetto' % (tiles, gvsoc_opts(args, hw))
+    cmd = 'make gvsoc tiles=%d pulp_cluster=0%s && make gvsoc2perfetto' % (tiles, gvsoc_opts(args, tiles, hw))
     rc, out = make(cmd)
     write(logf, '$ ' + cmd + '\n' + out)
     return rc
@@ -449,7 +503,7 @@ def build_test(test, tiles, build, logf):
 
 def run_test(test, tiles, hw, build, work, logf, args):
     cmd = ('make %s platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s%s'
-           % ('run' if args.no_profile else 'run_profiling', tiles, test.target, build, work, gvsoc_opts(args, hw)))
+           % ('run' if args.no_profile else 'run_profiling', tiles, test.target, build, work, gvsoc_opts(args, tiles, hw)))
     env = {}
     if not args.no_profile and not args.full_traces:  # through the environment: the Makefile's ?= defaults give way
         main = symbols(test, build)['main']
@@ -889,7 +943,9 @@ def main():
     for k in range(args.jobs):
         free.put(k)
     futures = []
-    gvsoc_hw, gvsoc_rc = None, 0  # (mesh side, hardware) gvsoc is built for, and its build's return code
+    main_futures = []  # the runs on gvsoc/
+    main_hw = None  # (mesh side, hardware) gvsoc/ is built for
+    gvsoc_rc = {}  # gvsoc tree -> return code of its build in this sweep
     try:
         for i, (t, cfg, tiles, hw) in enumerate(runs):
             rid = '%03d' % i
@@ -908,17 +964,21 @@ def main():
                 for p in list(srcs.saved):  # back to the committed sources
                     shutil.copy2(srcs.saved[p], p)
                 why = mgcc(t, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
-            if why is None and (tiles, hw) != gvsoc_hw:
-                wait(futures)  # the running jobs use the current gvsoc
+            gdir = gvsoc_dir(tiles, hw, args)
+            if why is None and gdir == GVSOC and (tiles, hw) != main_hw:
+                wait(main_futures)  # the running jobs on gvsoc/ use its current build
                 rep.log('  building gvsoc for tiles=%d%s...' % (tiles, hw_desc(hw)))
-                gvsoc_hw = (tiles, hw)
-                gvsoc_rc = build_gvsoc(tiles, hw, gvsoc_log, args)
+                main_hw = (tiles, hw)
+                gvsoc_rc[gdir] = build_gvsoc(tiles, hw, gvsoc_log, args)
+            elif why is None and gdir not in gvsoc_rc:
+                rep.log('  building the gvsoc copy for tiles=%d%s in %s...' % (tiles, hw_desc(hw), gdir))
+                gvsoc_rc[gdir] = build_gvsoc(tiles, hw, gvsoc_log, args)
             if why:
                 row['status'] = 'SKIP'
                 rep.log('  skipped: ' + why)
-            elif gvsoc_rc:
+            elif gvsoc_rc[gdir]:
                 row['status'] = 'GVSOC FAIL'
-                rep.log('  gvsoc build failed (rc=%d), see %s' % (gvsoc_rc, gvsoc_log))
+                rep.log('  gvsoc build failed (rc=%d), see %s' % (gvsoc_rc[gdir], gvsoc_log))
             else:
                 slot = free.get()
                 build, work = slot_dirs(out, slot)
@@ -933,6 +993,8 @@ def main():
                     # the sources may change from now on: the simulation only needs the build
                     futures.append(pool.submit(simulate, t, cfg, tiles, hw, row, rdir, slot, build, work, t0,
                                                '  ' + tag if args.jobs > 1 else ' ', args, rep, free))
+                    if gdir == GVSOC:
+                        main_futures.append(futures[-1])
                     continue
             rep.add(row)
         wait(futures)
