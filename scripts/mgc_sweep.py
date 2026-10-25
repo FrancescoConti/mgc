@@ -21,12 +21,13 @@ sources. Metrics:
     its own output tile, to the end of the last iDMA store (L1->L2)
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
-    plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa
+    plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa,
+    3*S*D*I for ffn (gate, up and down projections)
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
 
-Parameters (S, D, P, H, HKV, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
+Parameters (S, D, P, H, HKV, I, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 place. The test sources are restored at the end (also on Ctrl-C, or on the next start if the
 script was killed). D and H are written to test.h but not used by the current attention kernels.
@@ -103,9 +104,9 @@ GVSOC = os.path.join(REPO, 'gvsoc')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
-PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
+PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
-                  'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE'}
+                  'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE'}
 MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'T_SIZE']
 # gvsoc hardware knobs (None: the gvsoc default): Spatz VLEN in bits, RedMulE array as 'HxW'
 HW_PARAMS = ['spatz_vlen', 'redmule']
@@ -143,7 +144,7 @@ CSV_COLUMNS = [
 TABLE = [
     ('id', 'run_id', '{}'), ('test', 'test', '{}'), ('tiles', 'tiles', '{}'), ('VLEN', 'spatz_vlen', '{}'),
     ('RedMulE', 'redmule', '{}'), ('S', 'S', '{}'),
-    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
+    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
     ('T', 'T_SIZE', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
@@ -190,6 +191,8 @@ class Test:
             self.kind = 'mhsa'
         elif name.startswith('gqa'):
             self.kind = 'gqa'
+        elif name.startswith('ffn'):
+            self.kind = 'ffn'
         elif name == 'unfused_attn':
             self.kind = 'unfused_attn'
         else:
@@ -218,6 +221,8 @@ class Test:
     def macs(self, cfg):
         if self.kind == 'mm':
             return cfg['M'] * cfg['N'] * cfg['K'] * self.n_iterations
+        if self.kind == 'ffn':
+            return 3 * cfg['S'] * cfg['D'] * cfg['I']
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
         if self.kind not in ('mhsa', 'gqa'):
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
@@ -236,6 +241,8 @@ class Test:
                 return 'M and K must be multiples of tiles'
             if cfg['T_SIZE'] and (cfg['N'] % cfg['T_SIZE'] or cfg['N'] // cfg['T_SIZE'] < 2):
                 return 'N must be a multiple of T_SIZE, at least 2 timeslots'
+        if self.kind == 'ffn' and cfg['I'] % tiles:
+            return 'I must be a multiple of tiles'
         if self.kind == 'gqa' and cfg['H'] % cfg['HKV']:
             return 'H must be a multiple of HKV'
         if self.kind in ('flat_attn', 'mhsa', 'gqa'):
@@ -264,7 +271,7 @@ class Test:
 
 def list_tests():
     cm = read(os.path.join(MGC_TESTS, 'CMakeLists.txt'))
-    return re.findall(r'^add_subdirectory\((\w+)\)', cm, re.M)
+    return re.findall(r'^add_subdirectory\(([\w.]+)\)', cm, re.M)
 
 
 # --------------------------------------------------------------------------------------------
@@ -316,6 +323,8 @@ def generate(test, cfg, tiles, args, srcs, log):
 
     if test.kind == 'mm':
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
+    elif test.kind == 'ffn':
+        key = '%s_S%s_D%s_I%s_T%d' % (test.name, cfg['S'], cfg['D'], cfg['I'], tiles)
     else:
         # the flat_attn tests share one generator; mhsa/gqa tests have their own (e.g. the _masked ones)
         key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind if test.kind == 'flat_attn' else test.name,
@@ -335,6 +344,9 @@ def generate(test, cfg, tiles, args, srcs, log):
                    '--tiles', tiles, '--inc_dir', cache]
             if test.kind == 'gqa':
                 cmd += ['--n_kv_heads', cfg['HKV']]
+        elif test.kind == 'ffn':
+            cmd = [args.gen_python, test.gen, '--s_size', cfg['S'], '--e_size', cfg['D'], '--i_size', cfg['I'],
+                   '--tiles', tiles, '--inc_dir', cache]
         elif test.kind == 'mm':
             cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', cache]
         else:
