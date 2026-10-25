@@ -77,6 +77,7 @@ import argparse
 import csv
 import datetime
 import glob
+import hashlib
 import itertools
 import json
 import os
@@ -331,6 +332,11 @@ def generate(test, cfg, tiles, args, srcs, log):
                                                 cfg['S'], cfg['D'], cfg['P'], cfg['H'],
                                                 '_HKV%s' % cfg['HKV'] if test.kind == 'gqa' else '',
                                                 cfg['S_BLOCK_SIZE_KV'], tiles)
+    # a changed generator makes a new header
+    gen = FLAT_GEN if test.kind == 'flat_attn' else test.gen
+    if os.path.exists(gen):
+        with open(gen, 'rb') as f:
+            key += '_G' + hashlib.sha1(f.read()).hexdigest()[:8]
     cache = os.path.join(args.cache, key)
     cached = os.path.join(cache, 'test.h')
     if not os.path.exists(cached):
