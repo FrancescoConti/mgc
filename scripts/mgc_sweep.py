@@ -22,7 +22,7 @@ sources. Metrics:
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
     plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa,
-    3*S*D*I for ffn (gate, up and down projections)
+    3*S*D*I for ffn (gate, up and down projections), 2*S*D*I for ffn_gelu (up and down projections)
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
@@ -224,7 +224,7 @@ class Test:
         if self.kind == 'mm':
             return cfg['M'] * cfg['N'] * cfg['K'] * self.n_iterations
         if self.kind == 'ffn':
-            return 3 * cfg['S'] * cfg['D'] * cfg['I']
+            return (2 if self.name.startswith('ffn_gelu') else 3) * cfg['S'] * cfg['D'] * cfg['I']
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
         if self.kind not in ('mhsa', 'gqa'):
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
