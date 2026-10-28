@@ -33,6 +33,9 @@ Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from includ
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
+The blocks of the outer blocking loop of a test (H_NB heads of the attention tests, M_NB output rows of the mm
+tests), when not given, are instead 1, doubled until the test fits L1 (mgcc's check, with the configuration's
+sizes and L1; see choose_blocks()); conv_* choose theirs (CONV_NB) in the same way in their golden generator.
 
 Sweep: a JSON file with a list of groups, each the cartesian product of its lists (missing
 parameters take each test's default), e.g.
@@ -53,6 +56,10 @@ The knobs are gvsoc magia_v3 target parameters (spatz_vlen, spatz_nb_lanes, redm
 each (mesh side, hardware) is its own target of gvsoc/, with its own platform library: all the targets of
 the sweep are built in gvsoc/ before the first simulation, and runs on different targets then share the
 --jobs slots.
+l1_kib (--l1-kib) is the L1 per tile in KiB the tests use, not the simulated one: L1_SIZE + 1 of the tile
+address map, the only source of the L1 size (mgcc's fit check and define()s, test.c, the golden generators
+of ffn_* and conv_*), becomes l1_kib - 64 KiB (the stacks below L1_BASE), at most its 0xE0000 (1024 KiB also
+loses the 64 KiB of aliased peripherals): e.g. --l1-kib 1024 512 256 for 896, 448 and 192 KiB of buffers.
 Traces: by default make run_profiling dumps only the events the sweep measures, and gvsoc2perfetto
 reduces them to 5 bits per tile (CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in
 main: VFU% is N/A, and each run's (small) perfetto trace is kept in runs/<id>/. --full-traces dumps
@@ -109,14 +116,23 @@ BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
 # convolutions (conv_*): image IMG_H x IMG_W, CIN -> COUT channels, KS x KS kernel
-PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE',
+PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'H_NB', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'M_NB', 'T_SIZE',
           'IMG_H', 'IMG_W', 'CIN', 'COUT', 'KS']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
                   'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE',
                   'IMG_H': 'CONV_H', 'IMG_W': 'CONV_W', 'CIN': 'CONV_CIN', 'COUT': 'CONV_COUT', 'KS': 'CONV_K'}
-MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'T_SIZE']
+# blocking factors of the .mgc, outermost first (the order in which choose_blocks() makes them the largest that fit):
+# blocking factors of the .mgc: the outer blocking loops (H_NB blocks of heads of the attention tests, M_NB blocks
+# of output rows of the mm tests, see choose_blocks()), the timeslots of T_SIZE rows, the attention blocks
+MGC_DEFINES = ['H_NB', 'M_NB', 'T_SIZE', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
+OUTER_BLOCKS = ['H_NB', 'M_NB']
 # gvsoc hardware knobs (None: the gvsoc default): Spatz VLEN in bits and lanes, RedMulE array as 'HxW'
-HW_PARAMS = ['spatz_vlen', 'spatz_nb_lanes', 'redmule']
+# + the L1 per tile in KiB the tests use (None: the SDK's), which changes only the tile address map (see l1_sdk())
+HW_PARAMS = ['spatz_vlen', 'spatz_nb_lanes', 'redmule', 'l1_kib']
+TILE_ADDR_MAP = os.path.join('targets', 'magia', 'include', 'addr_map', 'tile_addr_map.h')
+L1_STACK_BYTES = 0x10000  # stacks of the tile, below L1_BASE
+with open(os.path.join(REPO, TILE_ADDR_MAP)) as _f:  # the SDK's L1_SIZE
+    L1_SIZE_DEFAULT = int(re.search(r'^#define\s+L1_SIZE\s+\(?(0x[0-9a-fA-F]+)', _f.read(), re.M).group(1), 16)
 # gvsoc defaults of the Spatz knobs and its lane width in bits, for hw_check()
 SPATZ_DEFAULT_VLEN, SPATZ_DEFAULT_LANES, SPATZ_LANE_BITS = 256, 4, 32
 # Only the gvsoc events analyze() reads (make's defaults dump ~20x more: asm, NoC, L2, ...),
@@ -152,10 +168,10 @@ CSV_COLUMNS = [
 # (header, csv column, format) of the human-readable table
 TABLE = [
     ('id', 'run_id', '{}'), ('test', 'test', '{}'), ('tiles', 'tiles', '{}'), ('VLEN', 'spatz_vlen', '{}'),
-    ('lanes', 'spatz_nb_lanes', '{}'), ('RedMulE', 'redmule', '{}'), ('S', 'S', '{}'),
-    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
+    ('lanes', 'spatz_nb_lanes', '{}'), ('RedMulE', 'redmule', '{}'), ('L1', 'l1_kib', '{}'), ('S', 'S', '{}'),
+    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('HNB', 'H_NB', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
-    ('T', 'T_SIZE', '{}'), ('IH', 'IMG_H', '{}'), ('IW', 'IMG_W', '{}'), ('Cin', 'CIN', '{}'),
+    ('MNB', 'M_NB', '{}'), ('T', 'T_SIZE', '{}'), ('IH', 'IMG_H', '{}'), ('IW', 'IMG_W', '{}'), ('Cin', 'CIN', '{}'),
     ('Cout', 'COUT', '{}'), ('KS', 'KS', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
     ('RedMulE%', 'redmule_pct', '{:.1f}'), ('iDMA%', 'idma_pct', '{:.1f}'),
@@ -192,6 +208,8 @@ class Test:
         self.header = os.path.join(self.dir, 'include', 'test.h')
         self.test_c = os.path.join(self.dir, 'src', 'test.c')
         self.gen = os.path.join(self.dir, 'gen_golden.py')
+        # its golden generator sizes the blocks over L1 (the tile address map's L1_SIZE)
+        self.l1_golden = os.path.exists(self.gen) and 'l1_bytes()' in read(self.gen)
         self.mgc = os.path.join(self.dir, name + '.mgc')
         if not os.path.exists(self.mgc):
             self.mgc = sorted(glob.glob(os.path.join(self.dir, '*.mgc')))[0]
@@ -262,6 +280,8 @@ class Test:
                 return 'M and K must be multiples of tiles'
             if cfg['T_SIZE'] and (cfg['N'] % cfg['T_SIZE'] or cfg['N'] // cfg['T_SIZE'] < 2):
                 return 'N must be a multiple of T_SIZE, at least 2 timeslots'
+            if cfg['M_NB'] and (cfg['M'] % cfg['M_NB'] or cfg['M'] // cfg['M_NB'] < tiles):
+                return 'M must be a multiple of M_NB, with at least tiles rows per block'
         if self.kind == 'ffn' and cfg['I'] % tiles:
             return 'I must be a multiple of tiles'
         if self.kind == 'conv':
@@ -272,6 +292,8 @@ class Test:
                     return 'IMG_H and COUT must leave every tile some rows and channels'
         if self.kind == 'gqa' and cfg['H'] % cfg['HKV']:
             return 'H must be a multiple of HKV'
+        if cfg['H_NB'] and cfg['H'] % cfg['H_NB']:
+            return 'H must be a multiple of H_NB'
         if self.kind in ('flat_attn', 'mhsa', 'gqa'):
             S, bq, bkv = cfg['S'], cfg['S_BLOCK_SIZE_Q'], cfg['S_BLOCK_SIZE_KV']
             if tiles & (tiles - 1):
@@ -340,8 +362,8 @@ class Sources:
         shutil.rmtree(BACKUP, ignore_errors=True)
 
 
-def golden_key(test, cfg, tiles):
-    """Name of the cache folder of the test.h of cfg."""
+def golden_key(test, cfg, tiles, l1=None):
+    """Name of the cache folder of the test.h of cfg (`l1`: see l1_kib())."""
     if test.kind == 'mm':
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
     elif test.kind == 'ffn':
@@ -355,6 +377,8 @@ def golden_key(test, cfg, tiles):
                                                 cfg['S'], cfg['D'], cfg['P'], cfg['H'],
                                                 '_HKV%s' % cfg['HKV'] if test.kind == 'gqa' else '',
                                                 cfg['S_BLOCK_SIZE_KV'], tiles)
+    if l1 and test.l1_golden:
+        key += '_L1%dK' % l1
     # a changed generator makes a new header
     gen = FLAT_GEN if test.kind == 'flat_attn' else test.gen
     if os.path.exists(gen):
@@ -363,11 +387,11 @@ def golden_key(test, cfg, tiles):
     return key
 
 
-def generate_golden(test, cfg, tiles, args, log):
+def generate_golden(test, cfg, tiles, args, log, l1=None):
     """Generate the test.h of cfg in the cache, if missing: in a temporary folder renamed into place
     once complete, so that parallel generations (pregenerate) and a running sweep never see a partial
-    test.h. Return None or an error string."""
-    key = golden_key(test, cfg, tiles)
+    test.h. `l1`: see l1_kib(). Return None or an error string."""
+    key = golden_key(test, cfg, tiles, l1)
     cache = os.path.join(args.cache, key)
     if os.path.exists(os.path.join(cache, 'test.h')):
         return None
@@ -375,7 +399,7 @@ def generate_golden(test, cfg, tiles, args, log):
     os.makedirs(args.cache, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix=key + '.', dir=args.cache)
     try:
-        env = dict(os.environ)
+        env = dict(os.environ, MAGIA_SDK=l1_sdk(args, l1))
         if test.kind in ('flat_attn', 'mhsa', 'gqa'):
             gen = FLAT_GEN if test.kind == 'flat_attn' else os.path.join(test.dir, 'gen_golden.py')
             cmd = [args.gen_python, gen, '--s_size', cfg['S'], '--e_size', cfg['D'],
@@ -417,18 +441,20 @@ def pregenerate(runs, args, log):
     one, before the runs; {cache key: error} of the ones that failed (their runs retry and report it)."""
     todo = {}
     for t, cfg, tiles, hw in runs:
-        if t.check(cfg, tiles) is None and t.needs_regen(cfg, tiles):
-            key = golden_key(t, cfg, tiles)
+        l1 = l1_kib(hw)
+        if id(cfg) not in NO_FIT and t.check(cfg, tiles) is None and regen_golden(t, cfg, tiles, l1):
+            key = golden_key(t, cfg, tiles, l1)
             # unfused_attn writes the test's own sources: generated in its run, one at a time
             if (t.kind != 'unfused_attn' and key not in todo
                     and not os.path.exists(os.path.join(args.cache, key, 'test.h'))):
-                todo[key] = (t, cfg, tiles)
+                todo[key] = (t, cfg, tiles, l1)
     if not todo:
         return {}
     log('generating %d test.h in parallel (%d at a time)...' % (len(todo), args.jobs))
     errors = {}
     with ThreadPoolExecutor(args.jobs) as pool:
-        futures = {pool.submit(generate_golden, t, cfg, tiles, args, log): key for key, (t, cfg, tiles) in todo.items()}
+        futures = {pool.submit(generate_golden, t, cfg, tiles, args, log, l1): key
+                   for key, (t, cfg, tiles, l1) in todo.items()}
         for f in futures:
             why = f.result()
             if why:
@@ -444,33 +470,137 @@ def pristine(test, orig):
         shutil.copy2(getattr(orig, a), getattr(test, a))
 
 
-def generate(test, cfg, tiles, args, log):
-    """Write test.h, the .mgc defines and test.c for cfg into `test`'s folder (a slot's mirror, see
-    mirror_sdk(), restored from the SDK by pristine() first); return None or an error string."""
-    why = generate_golden(test, cfg, tiles, args, log)
-    if why:
-        return why
-    shutil.copy2(os.path.join(args.cache, golden_key(test, cfg, tiles), 'test.h'), test.header)
+def generate(test, cfg, tiles, args, log, l1=None):
+    """Write test.h (if regen_golden()), the .mgc defines and test.c for cfg into `test`'s folder (a slot's mirror,
+    see mirror_sdk(), restored from the SDK by pristine() first); `l1`: see l1_kib(). Return None or an error
+    string."""
+    if regen_golden(test, cfg, tiles, l1):
+        why = generate_golden(test, cfg, tiles, args, log, l1)
+        if why:
+            return why
+        shutil.copy2(os.path.join(args.cache, golden_key(test, cfg, tiles, l1), 'test.h'), test.header)
 
     src = read(test.mgc)
     for p in MGC_DEFINES:
         if cfg[p] is not None:
             src = re.sub(r'^(%s\s*=\s*define\()\d+(\))' % p, r'\g<1>%d\2' % cfg[p], src, flags=re.M)
     write(test.mgc, src)
-    return mgcc(test, tiles, args, test.test_c, log)
+    return mgcc(test, tiles, args, test.test_c, log, l1)
 
 
-def mgcc(test, tiles, args, out, log):
+def regen_golden(test, cfg, tiles, l1):
+    """Whether cfg needs its own test.h: other sizes or mesh side than the committed one, or a golden generator
+    that sizes the blocks over the L1 `l1` (see l1_kib())."""
+    return test.needs_regen(cfg, tiles) or bool(l1 and test.l1_golden)
+
+
+def mgcc(test, tiles, args, out, log, l1=None):
     """Compile the test's .mgc to `out`, checking that its L1 buffers fit on a `tiles` x `tiles`
-    mesh (its warnings, e.g. buffers it could not size, go to `log`); the reason it failed, or None."""
+    mesh (its warnings, e.g. buffers it could not size, go to `log`), with the L1 `l1` (see l1_kib());
+    the reason it failed, or None."""
     r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '--header', test.header, '-o', out,
-                        '--tiles', str(tiles)], cwd=REPO, capture_output=True, text=True)
+                        '--tiles', str(tiles)], cwd=REPO, env=dict(os.environ, MAGIA_SDK=l1_sdk(args, l1)),
+                       capture_output=True, text=True)
     if r.returncode:
         return 'mgcc failed: ' + ' '.join(r.stderr.split())[:200]
     for line in r.stderr.splitlines():
         if ': warning: ' in line:
             log('  mgcc ' + line.split(': ', 1)[1])
     return None
+
+
+def l1_kib(hw):
+    """The L1 in KiB of the hardware `hw` if its buffers are not the SDK's (L1_SIZE + 1), else None."""
+    kib = hw['l1_kib']
+    return kib if kib and l1_buffers(kib) != L1_SIZE_DEFAULT + 1 else None
+
+
+def l1_buffers(kib):
+    """Bytes of L1 for the buffers of the tests with an L1 of `kib` KiB: all of it but the stacks, at most the
+    SDK's."""
+    return min(kib * 1024 - L1_STACK_BYTES, L1_SIZE_DEFAULT + 1)
+
+
+def l1_sdk(args, l1):
+    """MAGIA_SDK for the golden generators and mgcc with the L1 `l1` (see l1_kib()): the SDK, or a folder of the
+    cache with only its tile address map, L1_SIZE set to l1_buffers() - 1 (written once, renamed into place)."""
+    if not l1:
+        return REPO
+    root = os.path.join(args.cache, 'l1_%dK' % l1)
+    path = os.path.join(root, TILE_ADDR_MAP)
+    if not os.path.exists(path):
+        src, n = re.subn(r'^(#define\s+L1_SIZE\s+)\S+', r'\g<1>(0x%08X)' % (l1_buffers(l1) - 1),
+                         read(os.path.join(REPO, TILE_ADDR_MAP)), flags=re.M)
+        assert n == 1
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = '%s.%d.%d' % (path, os.getpid(), threading.get_ident())
+        write(tmp, src)
+        os.replace(tmp, path)
+    return root
+
+
+# blocks of an outer blocking loop not given by the sweep (choose_blocks())
+AUTO = 'auto'
+
+
+def fits_l1(t, cfg, tiles, args, l1, tmp):
+    """None if the .mgc of `t` with the blocking factors of cfg compiles and fits L1, else mgcc's error: mgcc's
+    L1 check on the committed .mgc and test.h, their sizes and blocking factors set to cfg's, in `tmp`."""
+    hdr = read(t.header)
+    for p, macro in HEADER_DEFINES.items():
+        if cfg[p] is not None:
+            hdr = re.sub(r'^(#define\s+%s\s+)\(?\d+\)?' % macro, r'\g<1>(%d)' % cfg[p], hdr, flags=re.M)
+    src = read(t.mgc)
+    for p in MGC_DEFINES:
+        if cfg[p] is not None:
+            src = re.sub(r'^(%s\s*=\s*define\()\d+(\))' % p, r'\g<1>%d\2' % cfg[p], src, flags=re.M)
+    mgc = os.path.join(tmp, os.path.basename(t.mgc))
+    write(os.path.join(tmp, 'test.h'), hdr)
+    write(mgc, src)
+    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), mgc, '--header', os.path.join(tmp, 'test.h'),
+                        '-o', os.devnull, '--no-format', '--tiles', str(tiles)],
+                       cwd=REPO, env=dict(os.environ, MAGIA_SDK=l1_sdk(args, l1)), capture_output=True, text=True)
+    return ' '.join(r.stderr.replace(mgc, os.path.basename(t.mgc)).split())[:200] if r.returncode else None
+
+
+# runs whose blocking factors left to the sweep have no value that fits (id of their cfg -> why), see choose_blocks()
+NO_FIT = {}
+
+
+def choose_blocks(runs, args):
+    """Set the blocks of the outer blocking loop of the runs that do not give them (AUTO): 1, doubled until the test
+    compiles and fits L1 (fits_l1()). If it never does (until check() fails, e.g. the blocks no longer divide the
+    dimension), the run is skipped (NO_FIT, with mgcc's last error), its blocks left at the test's default. In
+    parallel, --jobs at a time."""
+    def choose(t, cfg, tiles, l1):
+        p = next(p for p in OUTER_BLOCKS if cfg[p] == AUTO)
+        nb, why = 1, None
+        with tempfile.TemporaryDirectory() as tmp:
+            while t.check(dict(cfg, **{p: nb}), tiles) is None:
+                why = fits_l1(t, dict(cfg, **{p: nb}), tiles, args, l1, tmp)
+                if why is None:
+                    return {p: nb}, None
+                nb *= 2
+        return {p: t.defaults[p]}, 'no %s fits (%s=%d: %s)' % (p, p, nb // 2, why) if why else None
+
+    def key(t, cfg, tiles, hw):
+        return t.name, tiles, l1_kib(hw), tuple(cfg[p] for p in PARAMS)
+
+    todo = {}
+    for t, cfg, tiles, hw in runs:
+        if AUTO in cfg.values():
+            todo.setdefault(key(t, cfg, tiles, hw), (t, cfg, tiles, l1_kib(hw)))
+    if not todo:
+        return
+    print('choosing the outer blocks of %d configuration(s): 1, doubled until they fit L1...' % len(todo))
+    with ThreadPoolExecutor(args.jobs) as pool:
+        chosen = {k: pool.submit(choose, *v) for k, v in todo.items()}
+    for t, cfg, tiles, hw in runs:
+        if AUTO in cfg.values():
+            values, why = chosen[key(t, cfg, tiles, hw)].result()
+            cfg.update(values)
+            if why:
+                NO_FIT[id(cfg)] = why
 
 
 # --------------------------------------------------------------------------------------------
@@ -586,6 +716,8 @@ def hw_check(hw):
             return '%s=%d is not a power of two' % (name, v)
     if vlen < lanes * SPATZ_LANE_BITS:
         return 'spatz_vlen=%d < %d * spatz_nb_lanes=%d' % (vlen, SPATZ_LANE_BITS, lanes)
+    if hw['l1_kib'] is not None and l1_buffers(hw['l1_kib']) <= 0:
+        return 'l1_kib=%d leaves no L1 past the %d KiB of stacks' % (hw['l1_kib'], L1_STACK_BYTES // 1024)
     return None
 
 
@@ -630,8 +762,11 @@ def run_test(test, tiles, hw, build, work, logf, args, root=REPO):
 def parse_run(out):
     kills = {int(m.group(2)): int(m.group(1)) for m in re.finditer(
         r'^\d+: (\d+): .*kill-module.*Received kill request from port (\d+)', out, re.M)}
-    errs = [int(e) for e in re.findall(r'TILE \d+: Number of errors: (\d+)', out)]
-    return kills, errs
+    # a tile prints its running count after each check() (once per block of an outer blocking loop): the last
+    errs = {}
+    for t, e in re.findall(r'TILE (\d+): Number of errors: (\d+)', out):
+        errs[t] = int(e)
+    return kills, list(errs.values())
 
 
 # --------------------------------------------------------------------------------------------
@@ -879,7 +1014,7 @@ def expand(groups, tests):
                 sys.exit('unknown test %r (see --list)' % name)
             t = tests[name]
             app = t.applicable()
-            values = [g.get(p) or [t.defaults[p]] for p in app]
+            values = [g.get(p) or [AUTO if p in OUTER_BLOCKS else t.defaults[p]] for p in app]
             values = [v if isinstance(v, list) else [v] for v in values]
             for tiles in g['tiles']:
                 for hw_combo in itertools.product(*hw_values):
@@ -891,12 +1026,16 @@ def expand(groups, tests):
                         if key not in seen:
                             seen.add(key)
                             runs.append((t, cfg, tiles, hw))
+    return runs
+
+
+def sort_runs(runs):
+    """Sort the runs (their blocking factors chosen, see choose_blocks()) in place."""
     # mesh side and hardware outermost, so gvsoc is rebuilt once per (side, hardware); then tests
     # and parameters together, so the sources change as little as possible
     runs.sort(key=lambda r: (r[2], r[3]['spatz_vlen'] or 0, r[3]['spatz_nb_lanes'] or 0,
-                             redmule_hw(r[3]['redmule']) if r[3]['redmule'] else (0, 0),
+                             redmule_hw(r[3]['redmule']) if r[3]['redmule'] else (0, 0), -(r[3]['l1_kib'] or 0),
                              r[0].name, [r[1][p] or 0 for p in PARAMS]))
-    return runs
 
 
 def run_one(t, cfg, tiles, hw, row, rdir, t0, tag, args, rep, free, out, tests):
@@ -912,8 +1051,10 @@ def run_one(t, cfg, tiles, hw, row, rdir, t0, tag, args, rep, free, out, tests):
             mirror_sdk(root, tests)
         ts = t.at(root)
         pristine(ts, t)
-        if t.needs_regen(cfg, tiles):
-            why = generate(ts, cfg, tiles, args, rep.log)
+        l1 = l1_kib(hw)
+        shutil.copy2(os.path.join(l1_sdk(args, l1), TILE_ADDR_MAP), os.path.join(root, TILE_ADDR_MAP))
+        if t.needs_regen(cfg, tiles) or l1:
+            why = generate(ts, cfg, tiles, args, rep.log, l1)
         else:
             why = mgcc(ts, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
         if why:
@@ -1018,6 +1159,8 @@ def main():
                     help='gvsoc Spatz lane counts (default: gvsoc\'s, 4)')
     ap.add_argument('--redmule', nargs='+', metavar='HxW',
                     help='gvsoc RedMulE array sizes, e.g. 8x8 16x16 (default: gvsoc\'s, 8x8)')
+    ap.add_argument('--l1-kib', dest='l1_kib', nargs='+', type=int,
+                    help='L1 per tile in KiB the tests use, e.g. 1024 512 256 (default: the SDK\'s L1_SIZE)')
     ap.add_argument('--out', help='output directory (default: mgc_sweep/<date>_<time>)')
     ap.add_argument('--cache', default=os.path.join(SWEEP_DIR, 'cache'),
                     help='cache of generated test.h (default: %(default)s)')
@@ -1060,20 +1203,22 @@ def main():
         ap.error('give --sweep FILE or --tests')
     for g in groups:
         g.setdefault('tiles', args.tiles or [2])
+    args.cache = os.path.abspath(args.cache)
     runs = expand(groups, tests)
+    choose_blocks(runs, args)
+    sort_runs(runs)
 
     if args.dry_run:
         for i, (t, cfg, tiles, hw) in enumerate(runs):
-            why = hw_check(hw) or t.check(cfg, tiles)
+            why = hw_check(hw) or NO_FIT.get(id(cfg)) or t.check(cfg, tiles)
             print('%3d  %-20s tiles=%-2d%s %s%s%s' % (i, t.name, tiles, hw_desc(hw),
                                                     ' '.join('%s=%s' % (p, cfg[p]) for p in t.applicable()),
-                                                  '  [regenerate]' if t.needs_regen(cfg, tiles) else '',
+                                                  '  [regenerate]' if t.needs_regen(cfg, tiles) or l1_kib(hw) else '',
                                                   '  SKIP: ' + why if why else ''))
         return 0
 
     # absolute: the job paths under it are passed to gvrun, which runs in its work directory
     out = os.path.abspath(args.out or os.path.join(SWEEP_DIR, datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
-    args.cache = os.path.abspath(args.cache)
     os.makedirs(os.path.join(out, 'runs'), exist_ok=True)
     rep = Report(out)
     Sources.recover(rep.log)  # sources left modified by an interrupted sweep of an earlier version
@@ -1111,7 +1256,7 @@ def main():
             gvsoc_log = os.path.join(out, 'gvsoc_tiles%d%s.log' % (tiles, hw_desc(hw).replace(' ', '_')))
             key = (tiles, tuple(hw[p] for p in HW_PARAMS))
             t0 = time.time()
-            why = hw_check(hw) or t.check(cfg, tiles)
+            why = hw_check(hw) or NO_FIT.get(id(cfg)) or t.check(cfg, tiles)
             if why:
                 row['status'] = 'SKIP'
                 rep.log('  skipped: ' + why)
