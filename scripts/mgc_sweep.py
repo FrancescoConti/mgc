@@ -86,6 +86,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -315,14 +316,8 @@ class Sources:
         shutil.rmtree(BACKUP, ignore_errors=True)
 
 
-def generate(test, cfg, tiles, args, srcs, log):
-    """Write test.h, the .mgc defines and test.c for cfg; return None or an error string."""
-    for p in (test.header, test.test_c, test.mgc):
-        srcs.save(p)
-    # restart from the originals: a previous configuration may have changed them
-    for p in (test.header, test.test_c, test.mgc):
-        shutil.copy2(srcs.saved[p], p)
-
+def golden_key(test, cfg, tiles):
+    """Name of the cache folder of the test.h of cfg."""
     if test.kind == 'mm':
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
     elif test.kind == 'ffn':
@@ -338,37 +333,92 @@ def generate(test, cfg, tiles, args, srcs, log):
     if os.path.exists(gen):
         with open(gen, 'rb') as f:
             key += '_G' + hashlib.sha1(f.read()).hexdigest()[:8]
+    return key
+
+
+def generate_golden(test, cfg, tiles, args, log):
+    """Generate the test.h of cfg in the cache, if missing: in a temporary folder renamed into place
+    once complete, so that parallel generations (pregenerate) and a running sweep never see a partial
+    test.h. Return None or an error string."""
+    key = golden_key(test, cfg, tiles)
     cache = os.path.join(args.cache, key)
-    cached = os.path.join(cache, 'test.h')
-    if not os.path.exists(cached):
-        log('  generating test.h (%s)...' % key)
-        os.makedirs(cache, exist_ok=True)
+    if os.path.exists(os.path.join(cache, 'test.h')):
+        return None
+    log('  generating test.h (%s)...' % key)
+    os.makedirs(args.cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=key + '.', dir=args.cache)
+    try:
         env = dict(os.environ)
         if test.kind in ('flat_attn', 'mhsa', 'gqa'):
             gen = FLAT_GEN if test.kind == 'flat_attn' else os.path.join(test.dir, 'gen_golden.py')
             cmd = [args.gen_python, gen, '--s_size', cfg['S'], '--e_size', cfg['D'],
                    '--p_size', cfg['P'], '--n_heads', cfg['H'], '--block_kv', cfg['S_BLOCK_SIZE_KV'],
-                   '--tiles', tiles, '--inc_dir', cache]
+                   '--tiles', tiles, '--inc_dir', tmp]
             if test.kind == 'gqa':
                 cmd += ['--n_kv_heads', cfg['HKV']]
         elif test.kind == 'ffn':
             cmd = [args.gen_python, test.gen, '--s_size', cfg['S'], '--e_size', cfg['D'], '--i_size', cfg['I'],
-                   '--tiles', tiles, '--inc_dir', cache]
+                   '--tiles', tiles, '--inc_dir', tmp]
         elif test.kind == 'mm':
-            cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', cache]
+            cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', tmp]
         else:
-            # writes the test's own include/test.h (restored at the end)
+            # writes the test's own include/test.h (restored at the end): not in pregenerate()
             cmd = [args.gen_python, os.path.join(test.dir, 'gen_golden.py'),
                    '--s_size', cfg['S'], '--p_size', cfg['P']]
             env['PYTHONPATH'] = os.path.dirname(FLAT_GEN)
         r = subprocess.run([str(c) for c in cmd], cwd=REPO, env=env, capture_output=True, text=True)
-        write(os.path.join(cache, 'gen.log'), r.stdout + r.stderr)
+        write(os.path.join(tmp, 'gen.log'), r.stdout + r.stderr)
         if r.returncode:
-            shutil.rmtree(cache, ignore_errors=True)
             return 'golden generation failed: ' + (r.stderr.strip().splitlines() or ['?'])[-1]
         if test.kind == 'unfused_attn':
-            shutil.copy2(test.header, cached)
-    shutil.copy2(cached, test.header)
+            shutil.copy2(test.header, os.path.join(tmp, 'test.h'))
+        try:
+            os.rename(tmp, cache)
+        except OSError:
+            if not os.path.exists(os.path.join(cache, 'test.h')):  # else: generated meanwhile by another job
+                raise
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pregenerate(runs, args, log):
+    """Generate in parallel (--jobs at a time) the test.h of every configuration of the sweep that needs
+    one, before the runs; {cache key: error} of the ones that failed (their runs retry and report it)."""
+    todo = {}
+    for t, cfg, tiles, hw in runs:
+        if t.check(cfg, tiles) is None and t.needs_regen(cfg, tiles):
+            key = golden_key(t, cfg, tiles)
+            # unfused_attn writes the test's own sources: generated in its run, one at a time
+            if (t.kind != 'unfused_attn' and key not in todo
+                    and not os.path.exists(os.path.join(args.cache, key, 'test.h'))):
+                todo[key] = (t, cfg, tiles)
+    if not todo:
+        return {}
+    log('generating %d test.h in parallel (%d at a time)...' % (len(todo), args.jobs))
+    errors = {}
+    with ThreadPoolExecutor(args.jobs) as pool:
+        futures = {pool.submit(generate_golden, t, cfg, tiles, args, log): key for key, (t, cfg, tiles) in todo.items()}
+        for f in futures:
+            why = f.result()
+            if why:
+                errors[futures[f]] = why
+                log('  %s: %s' % (futures[f], why))
+    return errors
+
+
+def generate(test, cfg, tiles, args, srcs, log):
+    """Write test.h, the .mgc defines and test.c for cfg; return None or an error string."""
+    for p in (test.header, test.test_c, test.mgc):
+        srcs.save(p)
+    # restart from the originals: a previous configuration may have changed them
+    for p in (test.header, test.test_c, test.mgc):
+        shutil.copy2(srcs.saved[p], p)
+
+    why = generate_golden(test, cfg, tiles, args, log)
+    if why:
+        return why
+    shutil.copy2(os.path.join(args.cache, golden_key(test, cfg, tiles), 'test.h'), test.header)
 
     src = read(test.mgc)
     for p in MGC_DEFINES:
@@ -936,6 +986,8 @@ def main():
     if args.no_profile and args.full_traces:
         ap.error('--no-profile and --full-traces are exclusive')
     args.trace_processor = trace_processor_bin(args.trace_processor, rep.log)
+    if not args.dry_run:
+        pregenerate(runs, args, rep.log)
 
     pool = ThreadPoolExecutor(args.jobs)
     free = Queue()  # job slots not running a simulation
