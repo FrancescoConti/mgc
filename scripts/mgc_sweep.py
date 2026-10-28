@@ -33,11 +33,13 @@ Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from includ
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
-The block counts of a test (H_NB blocks of heads and PRJ_NB blocks of rows of the projections of the attention
-tests, M_NB blocks of output rows of the mm tests), when not given, are instead 1, doubled until the test fits L1
-(mgcc's check, with the configuration's sizes and L1; see choose_blocks()); conv_* and ffn_gelu choose theirs
-in the same way in their golden generator (FFN_NB; CONV_WNB blocks of output columns, then CONV_NB of output
-channels only when no column blocks fit).
+The blocking of a test (H_NB blocks of heads, PRJ_NB blocks of rows of the projections and the attention blocks
+S_BLOCK_SIZE_Q/KV of the attention tests, M_NB blocks of output rows of the mm tests), when not given, is instead
+chosen to fit L1 (mgcc's check, with the configuration's sizes and L1; see choose_blocks()): the block counts from
+1 and the attention blocks from the test's defaults, then, while the test does not fit, the first of them whose
+doubling (halving the attention blocks) lowers its L1 doubled. conv_* and ffn_gelu choose theirs in their golden
+generator (FFN_NB doubled; CONV_WNB blocks of output columns, then CONV_NB of output channels only when no column
+blocks fit).
 
 Sweep: a JSON file with a list of groups, each the cartesian product of its lists (missing
 parameters take each test's default), e.g.
@@ -129,6 +131,10 @@ HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': '
 # rows, the attention blocks
 MGC_DEFINES = ['H_NB', 'PRJ_NB', 'M_NB', 'T_SIZE', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
 OUTER_BLOCKS = ['H_NB', 'PRJ_NB', 'M_NB']
+# the attention blocks, also left to choose_blocks() when not given: from the test's default, halved (twice the blocks)
+ATT_BLOCKS = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
+# the order in which choose_blocks() tries to double the block counts ('S_BLOCK': halve the attention blocks)
+BLOCK_ORDER = ['H_NB', 'PRJ_NB', 'S_BLOCK', 'M_NB']
 # gvsoc hardware knobs (None: the gvsoc default): Spatz VLEN in bits and lanes, RedMulE array as 'HxW'
 # + the L1 per tile in KiB the tests use (None: the SDK's), which changes only the tile address map (see l1_sdk())
 HW_PARAMS = ['spatz_vlen', 'spatz_nb_lanes', 'redmule', 'l1_kib']
@@ -572,26 +578,56 @@ def fits_l1(t, cfg, tiles, args, l1, tmp):
 NO_FIT = {}
 
 
+def l1_bytes_of(err):
+    """The L1 bytes of mgcc's fit error `err` ('the L1 buffers of a tile take N bytes ...'), or None."""
+    m = re.search(r'take (?:at least )?(\d+) bytes', err or '')
+    return int(m.group(1)) if m else None
+
+
 def choose_blocks(runs, args):
-    """Set the block counts of the runs that do not give them (AUTO): all 1, and while the test does not compile and
-    fit L1 (fits_l1()), the first of them (in OUTER_BLOCKS order) that can still be doubled (check()) doubled. If
-    none can, the run is skipped (NO_FIT, with mgcc's last error), its counts left at the test's defaults. In
+    """Set the blocking of the runs that leave it to the sweep (AUTO): the block counts (H_NB, PRJ_NB, M_NB) from 1,
+    the attention blocks (S_BLOCK_SIZE_Q/KV) from the test's defaults. While the test does not compile and fit L1
+    (fits_l1()), the first of them in BLOCK_ORDER whose doubling (halving, for the attention blocks: twice the
+    blocks) is valid (check(); attention blocks multiples of tiles^2) and lowers the L1 the test takes is doubled. If
+    none does, the run is skipped (NO_FIT, with mgcc's last error), its blocking left at the test's defaults. In
     parallel, --jobs at a time."""
+    def doubled(t, cfg, tiles, p):
+        """cfg with block count p doubled, or None if that is not valid."""
+        if p == 'S_BLOCK':
+            auto = [q for q in ATT_BLOCKS if q in cfg['_auto']]
+            if not auto:
+                return None
+            c = dict(cfg, **{q: cfg[q] // 2 for q in auto})
+            if any(c[q] % (tiles * tiles) or cfg[q] % 2 for q in auto):
+                return None
+        else:
+            if p not in cfg['_auto']:
+                return None
+            c = dict(cfg, **{p: cfg[p] * 2})
+        return c if t.check(c, tiles) is None else None
+
     def choose(t, cfg, tiles, l1):
-        auto = [p for p in OUTER_BLOCKS if cfg[p] == AUTO]
-        nb = dict(cfg, **{p: 1 for p in auto})
+        auto = [p for p in OUTER_BLOCKS + ATT_BLOCKS if cfg[p] == AUTO]
+        nb = dict(cfg, **{p: t.defaults[p] if p in ATT_BLOCKS else 1 for p in auto}, _auto=auto)
         if t.check(nb, tiles):
             return {p: t.defaults[p] for p in auto}, None  # check() reports why
         with tempfile.TemporaryDirectory() as tmp:
-            while True:
-                why = fits_l1(t, nb, tiles, args, l1, tmp)
-                if why is None:
-                    return {p: nb[p] for p in auto}, None
-                p = next((p for p in auto if t.check(dict(nb, **{p: 2 * nb[p]}), tiles) is None), None)
-                if p is None:
+            why = fits_l1(t, nb, tiles, args, l1, tmp)
+            while why is not None:
+                used = l1_bytes_of(why)
+                for p in BLOCK_ORDER:
+                    c = doubled(t, nb, tiles, p)
+                    if c is None:
+                        continue
+                    w = fits_l1(t, c, tiles, args, l1, tmp)
+                    if w is None or (used is not None and (l1_bytes_of(w) or used) < used):
+                        nb, why = c, w
+                        break
+                else:
                     return ({p: t.defaults[p] for p in auto},
-                            'no %s fits (%s: %s)' % ('/'.join(auto), ', '.join('%s=%d' % (p, nb[p]) for p in auto), why))
-                nb[p] *= 2
+                            'no %s fits (%s: %s)' % ('/'.join(auto), ', '.join('%s=%d' % (p, nb[p]) for p in auto),
+                                                     why))
+        return {p: nb[p] for p in auto}, None
 
     def key(t, cfg, tiles, hw):
         return t.name, tiles, l1_kib(hw), tuple(cfg[p] for p in PARAMS)
@@ -1024,7 +1060,7 @@ def expand(groups, tests):
                 sys.exit('unknown test %r (see --list)' % name)
             t = tests[name]
             app = t.applicable()
-            values = [g.get(p) or [AUTO if p in OUTER_BLOCKS else t.defaults[p]] for p in app]
+            values = [g.get(p) or [AUTO if p in OUTER_BLOCKS + ATT_BLOCKS else t.defaults[p]] for p in app]
             values = [v if isinstance(v, list) else [v] for v in values]
             for tiles in g['tiles']:
                 for hw_combo in itertools.product(*hw_values):
