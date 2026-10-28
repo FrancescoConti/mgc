@@ -382,6 +382,28 @@ def main():
         self.assertNotIn('matmul', _c(IS, 'mm_is.mgc'))
 
 
+class PartialStore(unittest.TestCase):
+    """`idma.store(Y[...], y[i][0:n, :])`: the leading rows of a buffer into L2 (e.g. a partial last block)."""
+
+    STORE = '                idma.store(Y[m0:m0 + tile_h.size, tile_w], y).wait()\n'
+
+    def src(self, rows):
+        s = _read(OS, 'mm_os.mgc')
+        self.assertIn(self.STORE, s)
+        return s.replace(self.STORE, '                nv: u32 = tile_h.size - 1\n'
+                                     '                idma.store(Y[m0:m0 + nv, tile_w], y[0][%s, :]).wait()\n' % rows)
+
+    def test_leading_rows(self):
+        c = _c(OS, 'x.mgc', self.src('0:nv'))
+        # the buffer's row length and stride, nv rows
+        self.assertRegex(c, r'mg_idma_memcpy_2d\(WAIT_MODE,\s*1,\s*l2_addr_y \+ [^,]*,\s*l1_addr_y,\s*tile_w \* 2,'
+                            r'\s*K_SIZE \* 2,\s*m0 \+ nv - m0,')
+
+    def test_not_leading_rows(self):
+        with self.assertRaisesRegex(MgcError, 'leading rows'):
+            _c(OS, 'x.mgc', self.src('1:nv + 1'))
+
+
 class Errors(unittest.TestCase):
 
     def assertError(self, old, new, msg, d=OS, src='mm_os_explicit.mgc'):

@@ -155,11 +155,18 @@ class LegalizeIdma(ModulePass):
             return
         view = op.l2.data
         t = ts[view.tensor]
-        shp, bshp = view.shape, decl.shape
+        src = op.src.data if op.src is not None else None
+        shp, bshp = view.shape, (src or decl).shape
         if len(shp) != len(bshp) or not all(equal(x, y) for x, y in zip(shp, bshp)):
-            raise MgcError(op, f'shape mismatch: {view.tensor} slice is {shp}, `{a.sym.data}` is {bshp}')
+            raise MgcError(op, f'shape mismatch: {view.tensor} slice is {shp}, `{a.sym.data}`{" block" if src else ""} '
+                               f'is {bshp}')
         g = geometry(op, view, t)
-        if not same_xfer(g, a.xfer.data):
+        if src is not None:
+            # the leading rows of the buffer (`y[i][0:n, :]`): dense in L1, the transfer the L2 view's own
+            if not all(is_zero(x) for x in src.starts) or len(src.sizes) != len(decl.shape) or not all(
+                    equal(x, y) for x, y in zip(src.sizes[1:], decl.shape[1:])):
+                raise MgcError(op, f'a store into L2 takes the leading rows of `{a.sym.data}` (`{a.sym.data}[i][0:n, :]`)')
+        elif not same_xfer(g, a.xfer.data):
             raise MgcError(op, f'transfer geometry differs from the one `{a.sym.data}` was declared with')
         if view.tensor == decl.tensor:
             axi = Sym(f'l2_addr_{a.sym.data}')
@@ -172,5 +179,5 @@ class LegalizeIdma(ModulePass):
                 axi = BinOp('+', axi, Paren(product(diff, t.stride(d), Const(t.esize))))
         else:
             axi = base_addr(view, t)
-        op.attributes['xfer'] = ir.XferAttr(a.xfer.data)
+        op.attributes['xfer'] = ir.XferAttr(a.xfer.data if src is None else g)
         op.attributes['axi'] = ir.E(axi)

@@ -187,13 +187,15 @@ class RemoteView:
 
 @dataclass(eq=False)
 class LocalView:
-    """A block of a local single-slot buffer, `buf[r, :]`.
+    """A block of a local buffer: `buf[r, :]` (single-slot) or `buf[i][0:n, :]` (slot `index`).
 
     `view` selects elements of the buffer as in `RemoteView`, e.g. `[0, 0:+tile_h]`
-    for `rowms[0, :]`. Only the source of a store into a block of another buffer.
+    for `rowms[0, :]`. Only the source of a store: into a block of another buffer, or into
+    L2 when it is the leading rows of the buffer (`y[i][0:n, :]`, e.g. a partial last block).
     """
     buf: object  # Buf
     view: ir.View
+    index: Expr = Const(0)
 
 
 @dataclass(eq=False)
@@ -571,6 +573,9 @@ class Frontend:
                 return self.remote_view(n, v, idx)
             if isinstance(v, Buf) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
                 return LocalView(v, self.block_view(n, v, idx))
+            if isinstance(v, Slot) and isinstance(v.buf, Buf):
+                # a block of one slot of a (multi-)buffer, `y[i][0:n, :]`
+                return LocalView(v.buf, self.block_view(n, v.buf, idx, slot=True), v.index)
             if isinstance(v, (Buf, Remote, EvArray)):
                 if len(idx) != 1:
                     raise MgcError(n, 'multi-buffers and event arrays take a single index')
@@ -655,10 +660,10 @@ class Frontend:
         """
         return RemoteView(r, self.block_view(n, r.buf, idx, ' on another tile'))
 
-    def block_view(self, n, b, idx, where='') -> ir.View:
+    def block_view(self, n, b, idx, where='', slot=False) -> ir.View:
         """The tensorless `ir.View` selecting `b[idx...]` over the shape of
-        single-slot buffer `b` (indices as in `view()`)."""
-        if b.depth != 1:
+        single-slot buffer `b` (indices as in `view()`), or of one of its slots (`slot`)."""
+        if b.depth != 1 and not slot:
             raise MgcError(n, f'a block of `{b.name}`{where} needs a single-slot buffer')
         t = Tensor(b.name, None, b.view.shape, b.value.owner.dtype.data)
         v = self.view(n, t, idx)
@@ -960,15 +965,15 @@ class Frontend:
         else:
             sv = self.ev(src) if isinstance(src, ast.Subscript) else None
             if isinstance(sv, LocalView):
-                buf, idx = sv.buf, Const(0)
+                buf, idx = sv.buf, sv.index
                 attrs['src'] = ir.ViewAttr(sv.view)
             else:
                 buf, idx = self.operand(src)
             tv = self.ev(dst)
             d = 1
-            if 'src' in attrs and not isinstance(tv, RemoteView):
+            if 'src' in attrs and not isinstance(tv, (RemoteView, ir.View)):
                 raise MgcError(c, 'a block of a local buffer (`b[i, :]`) can only be stored into a block of '
-                               'another buffer (`c.at(y, x)[j, :]`)')
+                               'another buffer (`c.at(y, x)[j, :]`) or into L2')
             if isinstance(tv, ir.View):
                 attrs['l2'] = ir.ViewAttr(tv)
             elif isinstance(tv, (Remote, RemoteView)) or isinstance(tv, Slot) and isinstance(tv.buf, Remote):

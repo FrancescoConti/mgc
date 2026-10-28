@@ -283,6 +283,10 @@ class Emitter:
                     dst += f' + ({op.axi.data.c()})'
                 geo = [x.len.c()] + [e.c() for reps, std in x.outer for e in (std, reps)]
             axi = dst if base is None else f'{base} + ({dst} - l1_tile_base)'
+        elif op.src is not None:
+            # the leading rows of the buffer into L2: the geometry of this transfer
+            axi = op.axi.data.c()
+            geo = [x.len.c()] + [e.c() for reps, std in x.outer for e in (std, reps)]
         else:
             axi = op.axi.data.c()
             geo = [f'len_{n}']
