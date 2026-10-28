@@ -33,9 +33,11 @@ Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from includ
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
-The blocks of the outer blocking loop of a test (H_NB heads of the attention tests, M_NB output rows of the mm
-tests), when not given, are instead 1, doubled until the test fits L1 (mgcc's check, with the configuration's
-sizes and L1; see choose_blocks()); conv_* choose theirs (CONV_NB) in the same way in their golden generator.
+The block counts of a test (H_NB blocks of heads and PRJ_NB blocks of rows of the projections of the attention
+tests, M_NB blocks of output rows of the mm tests), when not given, are instead 1, doubled until the test fits L1
+(mgcc's check, with the configuration's sizes and L1; see choose_blocks()); conv_* and ffn_gelu choose theirs
+in the same way in their golden generator (FFN_NB; CONV_WNB blocks of output columns, then CONV_NB of output
+channels only when no column blocks fit).
 
 Sweep: a JSON file with a list of groups, each the cartesian product of its lists (missing
 parameters take each test's default), e.g.
@@ -116,16 +118,17 @@ BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
 # convolutions (conv_*): image IMG_H x IMG_W, CIN -> COUT channels, KS x KS kernel
-PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'H_NB', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'M_NB', 'T_SIZE',
+PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'H_NB', 'PRJ_NB', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'M_NB', 'T_SIZE',
           'IMG_H', 'IMG_W', 'CIN', 'COUT', 'KS']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
                   'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE',
                   'IMG_H': 'CONV_H', 'IMG_W': 'CONV_W', 'CIN': 'CONV_CIN', 'COUT': 'CONV_COUT', 'KS': 'CONV_K'}
 # blocking factors of the .mgc, outermost first (the order in which choose_blocks() makes them the largest that fit):
-# blocking factors of the .mgc: the outer blocking loops (H_NB blocks of heads of the attention tests, M_NB blocks
-# of output rows of the mm tests, see choose_blocks()), the timeslots of T_SIZE rows, the attention blocks
-MGC_DEFINES = ['H_NB', 'M_NB', 'T_SIZE', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
-OUTER_BLOCKS = ['H_NB', 'M_NB']
+# blocking factors of the .mgc: block counts (H_NB blocks of heads of the attention tests, their projections on
+# PRJ_NB blocks of rows, M_NB blocks of output rows of the mm tests, see choose_blocks()), the timeslots of T_SIZE
+# rows, the attention blocks
+MGC_DEFINES = ['H_NB', 'PRJ_NB', 'M_NB', 'T_SIZE', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
+OUTER_BLOCKS = ['H_NB', 'PRJ_NB', 'M_NB']
 # gvsoc hardware knobs (None: the gvsoc default): Spatz VLEN in bits and lanes, RedMulE array as 'HxW'
 # + the L1 per tile in KiB the tests use (None: the SDK's), which changes only the tile address map (see l1_sdk())
 HW_PARAMS = ['spatz_vlen', 'spatz_nb_lanes', 'redmule', 'l1_kib']
@@ -169,7 +172,7 @@ CSV_COLUMNS = [
 TABLE = [
     ('id', 'run_id', '{}'), ('test', 'test', '{}'), ('tiles', 'tiles', '{}'), ('VLEN', 'spatz_vlen', '{}'),
     ('lanes', 'spatz_nb_lanes', '{}'), ('RedMulE', 'redmule', '{}'), ('L1', 'l1_kib', '{}'), ('S', 'S', '{}'),
-    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('HNB', 'H_NB', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
+    ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('HNB', 'H_NB', '{}'), ('PNB', 'PRJ_NB', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
     ('MNB', 'M_NB', '{}'), ('T', 'T_SIZE', '{}'), ('IH', 'IMG_H', '{}'), ('IW', 'IMG_W', '{}'), ('Cin', 'CIN', '{}'),
     ('Cout', 'COUT', '{}'), ('KS', 'KS', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
@@ -294,6 +297,8 @@ class Test:
             return 'H must be a multiple of HKV'
         if cfg['H_NB'] and cfg['H'] % cfg['H_NB']:
             return 'H must be a multiple of H_NB'
+        if cfg['PRJ_NB'] and (cfg['S'] % cfg['PRJ_NB'] or cfg['S'] // cfg['PRJ_NB'] < tiles):
+            return 'S must be a multiple of PRJ_NB, with at least tiles rows per block'
         if self.kind in ('flat_attn', 'mhsa', 'gqa'):
             S, bq, bkv = cfg['S'], cfg['S_BLOCK_SIZE_Q'], cfg['S_BLOCK_SIZE_KV']
             if tiles & (tiles - 1):
@@ -568,20 +573,25 @@ NO_FIT = {}
 
 
 def choose_blocks(runs, args):
-    """Set the blocks of the outer blocking loop of the runs that do not give them (AUTO): 1, doubled until the test
-    compiles and fits L1 (fits_l1()). If it never does (until check() fails, e.g. the blocks no longer divide the
-    dimension), the run is skipped (NO_FIT, with mgcc's last error), its blocks left at the test's default. In
+    """Set the block counts of the runs that do not give them (AUTO): all 1, and while the test does not compile and
+    fit L1 (fits_l1()), the first of them (in OUTER_BLOCKS order) that can still be doubled (check()) doubled. If
+    none can, the run is skipped (NO_FIT, with mgcc's last error), its counts left at the test's defaults. In
     parallel, --jobs at a time."""
     def choose(t, cfg, tiles, l1):
-        p = next(p for p in OUTER_BLOCKS if cfg[p] == AUTO)
-        nb, why = 1, None
+        auto = [p for p in OUTER_BLOCKS if cfg[p] == AUTO]
+        nb = dict(cfg, **{p: 1 for p in auto})
+        if t.check(nb, tiles):
+            return {p: t.defaults[p] for p in auto}, None  # check() reports why
         with tempfile.TemporaryDirectory() as tmp:
-            while t.check(dict(cfg, **{p: nb}), tiles) is None:
-                why = fits_l1(t, dict(cfg, **{p: nb}), tiles, args, l1, tmp)
+            while True:
+                why = fits_l1(t, nb, tiles, args, l1, tmp)
                 if why is None:
-                    return {p: nb}, None
-                nb *= 2
-        return {p: t.defaults[p]}, 'no %s fits (%s=%d: %s)' % (p, p, nb // 2, why) if why else None
+                    return {p: nb[p] for p in auto}, None
+                p = next((p for p in auto if t.check(dict(nb, **{p: 2 * nb[p]}), tiles) is None), None)
+                if p is None:
+                    return ({p: t.defaults[p] for p in auto},
+                            'no %s fits (%s: %s)' % ('/'.join(auto), ', '.join('%s=%d' % (p, nb[p]) for p in auto), why))
+                nb[p] *= 2
 
     def key(t, cfg, tiles, hw):
         return t.name, tiles, l1_kib(hw), tuple(cfg[p] for p in PARAMS)
