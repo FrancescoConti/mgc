@@ -166,6 +166,11 @@ def sdk_macros() -> dict:
 # A .mgc may override it with `L1_MARGIN = define(N)`.
 L1_MARGIN = 64
 
+# rows of the M tiles of RedMulE (its array height: 8 on 8 x 8, 16 on 16 x 16; the largest used). The store of the
+# last M tile of a job also writes the rows past M up to the end of the tile, with zeros, at the Z row stride: past
+# the end of Z. l1-layout leaves that room after every buffer RedMulE writes, rounding its rows up to this.
+REDMULE_M_TILE = 16
+
 
 def sdk_l1_bytes() -> int:
     """Bytes of a tile's L1 for the mgc buffers, from L1_BASE up to the next tile's L1

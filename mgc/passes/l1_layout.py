@@ -15,7 +15,8 @@ largest end, computed at run time. When a buffer is accessed on another tile (`b
 `buf.at(y, x)`, `buf.row`, `buf.col`), the other tile's copy must be at the
 same offset, so slot sizes use the *maximum* tile sizes (`tile_h_max`): with
 actual sizes a clipped edge tile would lay its buffers out differently and
-receive data at the wrong address.
+receive data at the wrong address. A buffer that RedMulE writes (the Z of a job) has its rows rounded up to
+`devices.REDMULE_M_TILE`: the store of the last M tile also writes the rows past M, with zeros, past the end of Z.
 
 `buf.at_rel(dy, dx)` resolves to the neighbour's L1 base plus the local offset;
 the base is computed once per direction (`l1_base_s` = tile below, ...).
@@ -29,10 +30,10 @@ from dataclasses import dataclass
 from xdsl.dialects.builtin import ArrayAttr, StringAttr
 from xdsl.passes import ModulePass
 
-from .. import ir
+from .. import devices, ir
 from ..errors import MgcError
-from ..expr import Const, Raw, Sym, product
-from .common import esize, max_sizes, tensors
+from ..expr import BinOp, Const, Raw, Sym, add, product
+from .common import alloc_of, esize, max_sizes, tensors
 
 DIRS = {(1, 0): 's', (-1, 0): 'n', (0, 1): 'e', (0, -1): 'w'}
 
@@ -40,6 +41,13 @@ DIRS = {(1, 0): 's', (-1, 0): 'n', (0, 1): 'e', (0, -1): 'w'}
 def _overlap(a, b):
     """True if two loop intervals (`None`: every loop) overlap."""
     return a is None or b is None or (a[0] <= b[1] and b[0] <= a[1])
+
+
+def _round_up(rows, t):
+    """`rows` rounded up to a multiple of `t`: ((rows + t - 1) / t) * t."""
+    if isinstance(rows, Const):
+        return Const(-(-rows.v // t) * t)
+    return BinOp('*', BinOp('/', add(rows, Const(t - 1)), Const(t)), Const(t))
 
 
 def _max(ends):
@@ -64,6 +72,12 @@ class L1Layout(ModulePass):
 
     def apply(self, ctx, module):
         ts = tensors(module)
+        # buffers RedMulE writes (out / inout operands of its jobs)
+        z_bufs = set()
+        for op in module.walk():
+            if isinstance(op, ir.HwpeOp) and op.acc.data == 'redmule' and len(op.bufs):
+                roles = [r for _, r, _ in devices.HWPES['redmule'].jobs[op.job.data].operands]
+                z_bufs |= {id(alloc_of(v)) for v, r in zip(op.bufs, roles) if r != 'in'}
         remotes = [o for o in module.walk() if isinstance(o, ir.RemoteOp)]
         uniform = bool(remotes)
         # (loops, end address, ids of the buffers known to lie below its start, end offsets from
@@ -74,6 +88,9 @@ class L1Layout(ModulePass):
             shp = a.view.data.shape
             if uniform:
                 shp = [max_sizes(s) for s in shp]
+            pad = id(a) in z_bufs and len(shp) == 2
+            if pad:
+                shp = [_round_up(shp[0], devices.REDMULE_M_TILE)] + list(shp[1:])
             nbytes = product(*shp, Const(esize(a, ts)))
             depth = a.depth.data
             loops = (a.pin_lo.data, a.pin_hi.data) if a.pin_lo is not None else None
@@ -87,7 +104,10 @@ class L1Layout(ModulePass):
             else:
                 start = _max([b[1] for b in tops])
             starts = {e.c(): e for b in tops for e in b[3]} or {'0': Const(0)}
-            size = product(Const(depth), *[max_sizes(s) for s in a.view.data.shape], Const(esize(a, ts)))
+            mshp = [max_sizes(s) for s in a.view.data.shape]
+            if pad:
+                mshp[0] = _round_up(mshp[0], devices.REDMULE_M_TILE)
+            size = product(Const(depth), *mshp, Const(esize(a, ts)))
             ends = [s + size for s in starts.values()]
             addrs = []
             for k in range(depth):

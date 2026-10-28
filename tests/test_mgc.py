@@ -136,7 +136,8 @@ class Systolic(unittest.TestCase):
         # every tile must lay out L1 identically: worst-case (max) tile sizes
         self.assertIn('l1_addr_x_0 = l1_addr_w + (tile_h_max * tile_w_max * 2);', c)
         # ...whereas without neighbour access the actual sizes are used (as in mm_os)
-        self.assertIn('l1_addr_x_0 = l1_addr_y + (tile_h * tile_w * 2);', _c(OS, 'mm_os.mgc'))
+        # y, written by RedMulE, with its rows rounded up to its M tile (devices.REDMULE_M_TILE)
+        self.assertIn('l1_addr_x_0 = l1_addr_y + ((tile_h + 15) / 16 * 16 * tile_w * 2);', _c(OS, 'mm_os.mgc'))
 
     def test_is_east_and_row_barrier(self):
         c = _c(IS, 'mm_is.mgc')
