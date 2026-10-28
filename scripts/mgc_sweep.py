@@ -17,17 +17,19 @@ side simulate in parallel, each with its own CMAKE_BUILDDIR and GVSOC_WORK_DIR (
 and gvsoc_work/, the others in <out>/jobs/<k>/); builds stay serial, as they share the test
 sources. Metrics:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
-    without crt0 init and without tile 0's final check(); for mm tests, where each tile checks
-    its own output tile, to the end of the last iDMA store (L1->L2)
+    without crt0 init and without tile 0's final check(); for mm and conv tests, where each tile
+    checks its own output tile, to the end of the last iDMA store (L1->L2)
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
     plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa,
-    3*S*D*I for ffn (gate, up and down projections), 2*S*D*I for ffn_gelu (up and down projections)
+    3*S*D*I for ffn (gate, up and down projections), 2*S*D*I for ffn_gelu (up and down projections),
+    IMG_H*IMG_W*COUT*KS*KS*CIN for conv
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
 
-Parameters (S, D, P, H, HKV, I, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
+Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from include/test.h,
+S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 place. The test sources are restored at the end (also on Ctrl-C, or on the next start if the
 script was killed). D and H are written to test.h but not used by the current attention kernels.
@@ -105,9 +107,12 @@ SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
-PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
+# convolutions (conv_*): image IMG_H x IMG_W, CIN -> COUT channels, KS x KS kernel
+PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE',
+          'IMG_H', 'IMG_W', 'CIN', 'COUT', 'KS']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
-                  'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE'}
+                  'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE',
+                  'IMG_H': 'CONV_H', 'IMG_W': 'CONV_W', 'CIN': 'CONV_CIN', 'COUT': 'CONV_COUT', 'KS': 'CONV_K'}
 MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'T_SIZE']
 # gvsoc hardware knobs (None: the gvsoc default): Spatz VLEN in bits and lanes, RedMulE array as 'HxW'
 HW_PARAMS = ['spatz_vlen', 'spatz_nb_lanes', 'redmule']
@@ -149,7 +154,8 @@ TABLE = [
     ('lanes', 'spatz_nb_lanes', '{}'), ('RedMulE', 'redmule', '{}'), ('S', 'S', '{}'),
     ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
-    ('T', 'T_SIZE', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
+    ('T', 'T_SIZE', '{}'), ('IH', 'IMG_H', '{}'), ('IW', 'IMG_W', '{}'), ('Cin', 'CIN', '{}'),
+    ('Cout', 'COUT', '{}'), ('KS', 'KS', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
     ('RedMulE%', 'redmule_pct', '{:.1f}'), ('iDMA%', 'idma_pct', '{:.1f}'),
     ('in%', 'idma_in_pct', '{:.1f}'), ('out%', 'idma_out_pct', '{:.1f}'),
@@ -198,6 +204,8 @@ class Test:
             self.kind = 'ffn'
         elif name == 'unfused_attn':
             self.kind = 'unfused_attn'
+        elif name.startswith('conv'):
+            self.kind = 'conv'
         else:
             self.kind = 'mm'
         self.defaults = self._defaults()
@@ -226,6 +234,8 @@ class Test:
             return cfg['M'] * cfg['N'] * cfg['K'] * self.n_iterations
         if self.kind == 'ffn':
             return (2 if self.name.startswith('ffn_gelu') else 3) * cfg['S'] * cfg['D'] * cfg['I']
+        if self.kind == 'conv':
+            return cfg['IMG_H'] * cfg['IMG_W'] * cfg['COUT'] * cfg['KS'] * cfg['KS'] * cfg['CIN']
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
         if self.kind not in ('mhsa', 'gqa'):
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
@@ -246,6 +256,12 @@ class Test:
                 return 'N must be a multiple of T_SIZE, at least 2 timeslots'
         if self.kind == 'ffn' and cfg['I'] % tiles:
             return 'I must be a multiple of tiles'
+        if self.kind == 'conv':
+            if cfg['KS'] % 2 == 0 or cfg['IMG_H'] < cfg['KS']:
+                return 'KS must be odd and at most IMG_H'
+            for n in (cfg['IMG_H'], cfg['COUT']):  # output rows over the mesh rows, channels over its columns
+                if n - (tiles - 1) * -(-n // tiles) < 1:
+                    return 'IMG_H and COUT must leave every tile some rows and channels'
         if self.kind == 'gqa' and cfg['H'] % cfg['HKV']:
             return 'H must be a multiple of HKV'
         if self.kind in ('flat_attn', 'mhsa', 'gqa'):
@@ -322,6 +338,9 @@ def golden_key(test, cfg, tiles):
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
     elif test.kind == 'ffn':
         key = '%s_S%s_D%s_I%s_T%d' % (test.name, cfg['S'], cfg['D'], cfg['I'], tiles)
+    elif test.kind == 'conv':
+        key = '%s_H%s_W%s_CI%s_CO%s_K%s_T%d' % (test.name, cfg['IMG_H'], cfg['IMG_W'], cfg['CIN'], cfg['COUT'],
+                                                 cfg['KS'], tiles)
     else:
         # the flat_attn tests share one generator; mhsa/gqa tests have their own (e.g. the _masked ones)
         key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind if test.kind == 'flat_attn' else test.name,
@@ -361,6 +380,9 @@ def generate_golden(test, cfg, tiles, args, log):
                    '--tiles', tiles, '--inc_dir', tmp]
         elif test.kind == 'mm':
             cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', tmp]
+        elif test.kind == 'conv':
+            cmd = [args.gen_python, test.gen, '--h', cfg['IMG_H'], '--w', cfg['IMG_W'], '--cin', cfg['CIN'],
+                   '--cout', cfg['COUT'], '--ksize', cfg['KS'], '--tiles', tiles, '--inc_dir', tmp]
         else:
             # writes the test's own include/test.h (restored at the end): not in pregenerate()
             cmd = [args.gen_python, os.path.join(test.dir, 'gen_golden.py'),
@@ -695,7 +717,7 @@ def analyze(test, trace, kills, n_tiles, build, light, tp_bin=None):
                           % tracks[(0, 'cv32-core.function')])).as_pandas_dataframe().t[0]
         others = [c for t, c in kills.items() if t != 0] or list(kills.values())
         lo, hi = int(main0), max(others) * CYCLE_NS
-        if test.kind == 'mm':
+        if test.kind in ('mm', 'conv'):
             # every tile checks its own output tile after storing it: end at the last store
             stores = [slices(t, 'idma-obi2axi.be.busy') for t in range(n_tiles)]
             hi = min(hi, max(int(s[:, 1].max()) for s in stores if len(s)))

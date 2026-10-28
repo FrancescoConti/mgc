@@ -615,6 +615,13 @@ FlatAttention) or the test's `gen_golden.py`.
 | `gqa_pipeopt3` | grouped-query attention (`HKV` K/V heads for `H` Q heads), as `mhsa_pipeopt3` |
 | `mhsa_pipeopt3_masked`, `gqa_pipeopt3_masked` | the same with an additive attention mask |
 
+Convolution, as an im2col GEMM with RedMulE for the products and Spatz for the im2col.
+
+| Directory | Content |
+|---|---|
+| `conv_im2col` | `CONV_K` x `CONV_K` convolution (odd, default 3), stride 1, "same" zero padding, HWC: per block of output pixels, a 4-stage pipeline of the input rows by iDMA, the im2col (with the padding) on Spatz (`args=` of `l1_kernel` give it the row and column), the GEMM with the resident weights on RedMulE and the output store by iDMA |
+| `conv_im2col_opt` | `conv_im2col` with the im2col shared by the tiles of a mesh row: each builds its part of the block on Spatz, in tasks of about 12 KiB, and multicasts each one to the others while Spatz builds the next; a row barrier ends every pipeline step |
+
 ## Sweeps: `scripts/`
 
 `scripts/mgc_sweep.py` runs the tests over a sweep of mesh sizes and problem sizes on gvsoc and
