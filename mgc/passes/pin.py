@@ -7,9 +7,10 @@
 
 `L1.single_buffer(view, pin="qk")` pins a buffer to the loop `pipeline(n, name="qk")`
 (also `systolic()`); `pin=("a", "b")` to several loops, which must be back-to-back.
-Named loops sit directly in the `tiles()` body (or in the body of its outer blocking loop),
-where they split it into stretches: the stretch of loop k runs from the end of loop k - 1 to
-the start of loop k + 1, so the statements between two loops belong to both. A buffer pinned to loops lo..hi:
+Named loops sit directly in the `tiles()` body (or in the body of its outer blocking loop), or
+alone in a plain `for` loop there (whose position they take), where they split it into
+stretches: the stretch of loop k runs from the end of loop k - 1 to the start of loop k + 1, so
+the statements between two loops belong to both. A buffer pinned to loops lo..hi:
 
 * is used only in the stretches of lo..hi. A transfer or job uses its buffers until
   its `.wait()`;
@@ -65,14 +66,25 @@ class PinCheck(ModulePass):
         top = list(body.ops)
         pos = {id(o): k for k, o in enumerate(top)}
 
+        def top_of(op):
+            while op.parent_block() is not body:
+                op = op.parent_op()
+            return op
+
         names = {}
+        tops = {}
         for lp in loops:
-            if lp.parent_block() is not body:
-                raise MgcError(lp, f'named {lp.kind.data}() loops go directly in the tiles() body')
+            t = top_of(lp)
+            # directly in the body, or in a plain for loop in it (e.g. blocks of a step), one per such loop
+            if t is not lp and (not isinstance(t, ir.ForOp) or any(
+                    isinstance(o, ir.PipelineOp) and o is not lp for o in t.walk() if o is not t)):
+                raise MgcError(lp, f'named {lp.kind.data}() loops go directly in the tiles() body, or alone in a '
+                                   f'plain for loop in it')
             if lp.label.data in names:
                 raise MgcError(lp, f'two loops are named "{lp.label.data}"')
             names[lp.label.data] = len(names)
-        at = [pos[id(lp)] for lp in loops]  # position of each named loop in the tiles() body
+            tops[id(lp)] = t
+        at = [pos[id(tops[id(lp)])] for lp in loops]  # position of each named loop (or its for loop) in the body
 
         for a in pinned.values():
             ks = []

@@ -590,8 +590,9 @@ class TopFunction(unittest.TestCase):
 
     def top(self, deco='@top', fname='my_gemm', drop_check=True):
         src = _read(OS, 'mm_os.mgc').replace(self.TEST_DECO, f'{deco}\ndef {fname}():')
-        if drop_check:
-            src = '\n'.join(l for l in src.splitlines() if not l.strip().startswith('check('))
+        if drop_check:  # the check and the two ifs it is in
+            src = src.replace('        if y_id == 0:\n            if x_id == 0:\n'
+                              '                check(Y[:, :], Z[:, :], tol=0x11)\n', '')
         return src
 
     def test_top_emits_function(self):
@@ -1056,11 +1057,29 @@ def main():
             self.assertIn(f'uint32_t l1_addr_{buf}_0 = l1_addr_w + (', c)
 
     def test_named_loop_in_tile_body(self):
+        # alone in a plain for loop in the body it is fine, not in an if
         self.assertError([('        for i in pipeline(steps, name="three"):\n',
-                           '        for z in range(2):\n          for i in pipeline(steps, name="three"):\n'),
+                           '        if x_id == 0:\n          for i in pipeline(steps, name="three"):\n'),
                           ('            with stage(0):\n                ec', '              with stage(0):\n                ec'),
                           ('            with stage(1):\n                ec', '              with stage(1):\n                ec')],
                          'go directly in the tiles() body')
+
+    def test_named_loop_alone_in_for(self):
+        # a named loop alone in a plain for loop of the body (e.g. blocks of a step) takes the for loop's place
+        c = self.c(('        for i in pipeline(steps, name="three"):\n',
+                    '        for z in range(2):\n          for i in pipeline(steps, name="three"):\n'),
+                   ('            with stage(0):\n                ec', '              with stage(0):\n                ec'),
+                   ('            with stage(1):\n                ec', '              with stage(1):\n                ec'))
+        self.assertIn('for (int z = 0; z < 2; z++) {', c)
+        # two named loops in the same for loop are not
+        self.assertError([('        for i in pipeline(steps, name="two"):\n',
+                           '        for z in range(2):\n          for i in pipeline(steps, name="two"):\n'),
+                          ('            with stage(0):\n                eb', '              with stage(0):\n                eb'),
+                          ('            with stage(1):\n                eb.wait()\n',
+                           '              with stage(1):\n                eb.wait()\n'
+                           '          for j in pipeline(steps, name="four"):\n              with stage(0):\n'
+                           '                pass\n')],
+                         'alone in a plain for loop')
 
     def test_last_declared_once(self):
         # three loops over `i` with a run-time trip count: `i_last` is declared by the first only

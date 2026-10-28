@@ -314,7 +314,8 @@ for c in pipeline(sm_rows // SM_CHUNK, name="softmax"):
     ...
 ```
 
-Named loops go directly in the `tiles()` body (or its outer blocking loop), where they split it
+Named loops go directly in the `tiles()` body (or its outer blocking loop), or alone in a plain
+`for` loop there (e.g. over blocks of one step), whose place they take; they split the body
 into **stretches**: the stretch of a loop runs from the end of the previous named loop to the
 start of the next one, so the statements between two loops belong to both. The `pin-check`
 pass makes sure that a pinned buffer
