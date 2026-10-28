@@ -527,6 +527,7 @@ class Emitter:
         for k in self.kdefs.values():
             ops = [o.data.partition(':')[0] for o in k.operands_.data]
             ps = [f'p{i}' for i in range(len(k.params.data))]
+            ps += [a.data for a in k.args.data] if k.args is not None else []
             sig = ', '.join(f'uint32_t {x}' for x in ops + ps)
             out.append(f'/** L1 kernel ({k.executor.data}): all pointers are L1 addresses. */')
             out.append(f'extern void {k.cname.data}({sig});')

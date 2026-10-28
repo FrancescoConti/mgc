@@ -231,6 +231,7 @@ class KernelOp(IRDLOperation):
     operands_ = attr_def(ArrayAttr)  # "name:role"
     params = attr_def(ArrayAttr)  # expressions over operand shapes
     executor = attr_def(StringAttr)
+    args = opt_attr_def(ArrayAttr)  # names of the scalar arguments, given at each call
 
 
 @irdl_op_definition
@@ -419,6 +420,7 @@ class JobOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)  # job-lower
     addrs = opt_attr_def(ArrayAttr)  # multi-buffer
+    args = opt_attr_def(ArrayAttr)  # L1 kernel: the scalar arguments of the call (expressions)
     alt = opt_attr_def(StringAttr)  # uninit-acc: job run instead when `alt_if` holds
     alt_if = opt_attr_def(ExprAttr)  # uninit-acc
 

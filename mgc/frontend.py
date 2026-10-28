@@ -213,13 +213,16 @@ class Kernel:
 
     `sym` is the Python name, `cname` the C function, `operands` the list of
     `(name, role)` with role in `in`/`out`/`inout`, `params` the extra integer
-    arguments (`"src.size"`) and `executor` who runs it (`CORE`).
+    arguments derived from operand shapes (`"src.size"`), `args` the names of the
+    integer arguments given at each call (`k(dst, src, row)`), and `executor` who
+    runs it (`CORE`).
     """
     sym: str
     cname: str
     operands: List[tuple]  # (name, role)
     params: List[str]
     executor: str
+    args: List[str]
 
 
 # ----------------------------------------------------------------------------
@@ -465,7 +468,10 @@ class Frontend:
         Later `scale(d, s)` in the tile loop becomes the C call
         `scale_fp16(addr_d, addr_s, size_of_s)`. Operands are L1 buffers with a
         role (used to order operations); params are integer arguments derived
-        from operand shapes. Emits a `mg.kernel` op and binds `sym` to a `Kernel`.
+        from operand shapes. `args=("row", ...)` names integer arguments given
+        at each call after the operands, as expressions (`k(d, s, i * 4)`); they
+        come last in the C call. Emits a `mg.kernel` op and binds `sym` to a
+        `Kernel`.
         """
         args = s.value.args
         if len(args) != 1:
@@ -481,17 +487,23 @@ class Frontend:
         if not ops:
             raise MgcError(s, 'an L1 kernel needs at least one L1 operand')
         params = list(ast.literal_eval(kw.pop('params', ast.Tuple([], ast.Load()))))
+        kargs = list(ast.literal_eval(kw.pop('args', ast.Tuple([], ast.Load()))))
+        for a in kargs:
+            if not isinstance(a, str) or not a.isidentifier():
+                raise MgcError(s, f'args: {a!r} is not a C identifier')
         ex = _name(kw.pop('executor', ast.Name('CORE', ast.Load())))
         if ex not in devices.EXECUTORS:
             raise MgcError(s, f'unsupported executor {ex}; supported: {", ".join(devices.EXECUTORS)}')
         if kw:
             raise MgcError(s, f'unknown l1_kernel arguments: {", ".join(kw)}')
-        k = Kernel(sym, cname, ops, params, ex)
+        k = Kernel(sym, cname, ops, params, ex, kargs)
         self.env[sym] = k
-        self.module_ops.append(ir.KernelOp.create(attributes={
-            'sym': StringAttr(sym), 'cname': StringAttr(cname),
-            'operands_': ir.strs([f'{n}:{r}' for n, r in ops]), 'params': ir.strs(params),
-            'executor': StringAttr(ex)}))
+        attrs = {'sym': StringAttr(sym), 'cname': StringAttr(cname),
+                 'operands_': ir.strs([f'{n}:{r}' for n, r in ops]), 'params': ir.strs(params),
+                 'executor': StringAttr(ex)}
+        if kargs:
+            attrs['args'] = ir.strs(kargs)
+        self.module_ops.append(ir.KernelOp.create(attributes=attrs))
 
     # -- expressions ---------------------------------------------------------
     def ev(self, n):
@@ -1076,14 +1088,22 @@ class Frontend:
 
     def kernel_call(self, c, k: Kernel, s):
         """Call of an `l1_kernel`, e.g. `scale(dst[0], src[0])`: positional L1
-        operands in the declared order. Emits a synchronous `mg.job`."""
+        operands in the declared order, then its `args` as integer expressions.
+        Emits a synchronous `mg.job`."""
         if c.keywords:
-            raise MgcError(c, f'{k.sym}() takes its L1 operands positionally')
-        if len(c.args) != len(k.operands):
-            raise MgcError(c, f'{k.sym}() takes {len(k.operands)} L1 operands, got {len(c.args)}')
-        bufs, slots = self._job_operands(c, s)
-        self.add(ir.JobOp.create(operands=bufs, attributes={'kernel': StringAttr(k.sym),
-                                                              'slots': ir.exprs(slots)}), s)
+            raise MgcError(c, f'{k.sym}() takes its L1 operands and arguments positionally')
+        n_ops, n_args = len(k.operands), len(k.args)
+        if len(c.args) != n_ops + n_args:
+            raise MgcError(c, f'{k.sym}() takes {n_ops} L1 operand{"s" if n_ops > 1 else ""}'
+                              + (f' and {n_args} argument{"s" if n_args > 1 else ""} ({", ".join(k.args)})'
+                                 if n_args else '')
+                              + f', got {len(c.args)}')
+        args = [self.expr(a) for a in c.args[n_ops:]]
+        bufs, slots = self._job_operands(ast.Call(c.func, c.args[:n_ops], []), s)
+        attrs = {'kernel': StringAttr(k.sym), 'slots': ir.exprs(slots)}
+        if args:
+            attrs['args'] = ir.exprs(args)
+        self.add(ir.JobOp.create(operands=bufs, attributes=attrs), s)
         return None
 
     def check(self, c, s):

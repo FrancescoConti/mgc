@@ -87,6 +87,8 @@ class JobLower(ModulePass):
                     names = [o.data.partition(':')[0] for o in kd.operands_.data]
                     shp = operand_shapes(op, names, ts)
                     params = [eval_shape_expr(p.data, shp, op) for p in kd.params.data]
+                    if op.args is not None:
+                        params += [a.data for a in op.args.data]
                     new = ir.CallOp.create(operands=list(op.bufs), attributes={
                         'kernel': StringAttr(k), 'slots': op.slots, 'params': ir.exprs(params)})
                 new.lineno = getattr(op, 'lineno', None)

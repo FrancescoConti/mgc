@@ -202,6 +202,23 @@ class Kernels(unittest.TestCase):
             _c(L1K, 'x.mgc', src)
         self.assertIn('takes 2 L1 operands', str(cm.exception))
 
+    def test_kernel_scalar_args(self):
+        # args= names integer arguments given after the operands, last in the C call; in a
+        # pipeline stage they are the expressions of that stage's iteration
+        src = (_read(L1K, 'mm_os_l1k.mgc')
+               .replace('params=("src.size",), executor=CORE)', 'params=("src.size",), args=("row", "col"), executor=CORE)')
+               .replace('copy(x[i], x_raw[i])', 'copy(x[i], x_raw[i], i * 2, tile_h.start)'))
+        c = _c(L1K, 'x.mgc', src)
+        self.assertIn('extern void l1_copy_fp16(uint32_t dst, uint32_t src, uint32_t p0, uint32_t row, uint32_t col);', c)
+        self.assertIn('l1_copy_fp16(x_pt, x_raw_pt, tile_h * t_size, i * 2, tile_h_max * y_id);', c)
+
+    def test_kernel_scalar_arg_count(self):
+        src = (_read(L1K, 'mm_os_l1k.mgc')
+               .replace('params=("src.size",), executor=CORE)', 'params=("src.size",), args=("row",), executor=CORE)'))
+        with self.assertRaises(MgcError) as cm:
+            _c(L1K, 'x.mgc', src)
+        self.assertIn('takes 2 L1 operands and 1 argument (row), got 2', str(cm.exception))
+
     def test_kernel_operands_must_be_l1(self):
         src = _read(L1K, 'mm_os_l1k.mgc').replace('copy(x[i], x_raw[i])', 'copy(x[i], X[tile_h, 0:t_size])')
         with self.assertRaises(MgcError) as cm:
