@@ -160,6 +160,13 @@ def sdk_macros() -> dict:
         return {}
 
 
+# bytes of L1 that the mgc buffers leave free at the end of a tile's L1: an access just past the last buffer
+# (e.g. an engine overfetching) must not leave the L1, whose end is unmapped. The L1 fit check uses
+# sdk_l1_bytes() - L1_MARGIN; the generated C defines it too, for the `define()`s that size buffers over L1_SIZE.
+# A .mgc may override it with `L1_MARGIN = define(N)`.
+L1_MARGIN = 64
+
+
 def sdk_l1_bytes() -> int:
     """Bytes of a tile's L1 for the mgc buffers, from L1_BASE up to the next tile's L1
     (L1_TILE_OFFSET) in the SDK's tile address map, e.g. 0x100000 - 0x20000 = 0xE0000.

@@ -1145,9 +1145,37 @@ class L1Fit(unittest.TestCase):
         self._compile(1024, [2])
 
     def test_explicit_l1_bytes(self):
-        with self.assertRaisesRegex(MgcError, 'more than the 1048576 bytes'):
+        with self.assertRaisesRegex(MgcError, r'more than the 1048512 bytes of L1 \(1048576 minus the L1_MARGIN of 64\)'):
             self._compile(1024, [2], l1_bytes=1 << 20)
         self._compile(1024, [2], l1_bytes=4 << 20)
+
+    def test_margin(self):
+        # 2x2 mesh, 1024-row blocks: 2235392 bytes; they fit exactly 2235392 + L1_MARGIN bytes
+        self._compile(1024, [2], l1_bytes=2235392 + 64)
+        with self.assertRaisesRegex(MgcError, r'take 2235392 bytes .* minus the L1_MARGIN of 64'):
+            self._compile(1024, [2], l1_bytes=2235392 + 63)
+        with self.assertRaisesRegex(MgcError, r'take 2235392 bytes .* minus the L1_MARGIN of 64'):
+            self._compile(1024, [2], l1_bytes=2235392)
+
+    def test_margin_override(self):
+        # a .mgc may set its own L1_MARGIN
+        src = _read(self.FA, 'flat_attn_pipeopt3.mgc').replace('S_BLOCK_SIZE_Q  = define(512)',
+                                                              'L1_MARGIN = define(0)\nS_BLOCK_SIZE_Q  = define(1024)')
+        src = src.replace('S_BLOCK_SIZE_KV = define(512)', 'S_BLOCK_SIZE_KV = define(1024)')
+        compile_module(src, 'x.mgc', _hdr(self.FA), tiles=[2], l1_bytes=2235392)
+        with self.assertRaisesRegex(MgcError, 'minus the L1_MARGIN of 4096'):
+            compile_module(src.replace('L1_MARGIN = define(0)', 'L1_MARGIN = define(4096)'), 'x.mgc', _hdr(self.FA),
+                           tiles=[2], l1_bytes=2235392)
+
+    def test_margin_define(self):
+        # define()s may size buffers over L1_MARGIN: the generated C defines it (default 64), only then
+        src = _read(self.FA, 'flat_attn_pipeopt3.mgc')
+        c = compile_source(src, 'x.mgc', _hdr(self.FA))
+        self.assertNotIn('L1_MARGIN', c)
+        c = compile_source(src.replace('S_BLOCK_SIZE_Q  = define(512)',
+                                       'S_BLOCK_SIZE_Q  = define("((L1_SIZE + 1 - L1_MARGIN) / 1792)")'),
+                           'x.mgc', _hdr(self.FA), tiles=[4])
+        self.assertIn('#define L1_MARGIN (64)', c)
 
     def test_no_l1_size(self):
         self._sdk(None)

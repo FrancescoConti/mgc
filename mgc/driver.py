@@ -15,7 +15,7 @@ from xdsl.printer import Printer
 
 from . import ir
 from .cexpr import evaluate, object_macros, undefined
-from .devices import sdk_l1_bytes, sdk_macros
+from .devices import L1_MARGIN, sdk_l1_bytes, sdk_macros
 from .emit_c import emit
 from .errors import MgcError, MgcWarning
 from .expr import Const
@@ -34,9 +34,10 @@ def print_ir(module) -> str:
 
 
 def check_l1(module, header, tiles, l1_bytes=None):
-    """Raise `MgcError` if the L1 buffers of a tile do not fit `l1_bytes` on a `tiles` x `tiles`
-    mesh, for each of the mesh sides `tiles`. `l1_bytes` None: read from the SDK
-    (`devices.sdk_l1_bytes`, an error if it cannot be found).
+    """Raise `MgcError` if the L1 buffers of a tile do not fit `l1_bytes` minus `L1_MARGIN` on a
+    `tiles` x `tiles` mesh, for each of the mesh sides `tiles`. `l1_bytes` None: read from the SDK
+    (`devices.sdk_l1_bytes`, an error if it cannot be found). `L1_MARGIN`: the .mgc's
+    `define()` if it has one, else `devices.L1_MARGIN` (64 bytes).
 
     The footprint (`l1_ends` from l1-layout) is evaluated with the `define()`s, the macros of
     the test header and of the SDK's tile address map (C expressions too, e.g.
@@ -52,7 +53,7 @@ def check_l1(module, header, tiles, l1_bytes=None):
         return
     if l1_bytes is None:
         l1_bytes = sdk_l1_bytes()
-    macros = {**sdk_macros(), **object_macros(parse_header(header)[1])}
+    macros = {**sdk_macros(), **object_macros(parse_header(header)[1]), 'L1_MARGIN': '(%d)' % L1_MARGIN}
     for d in module.walk():
         if isinstance(d, ir.DefineOp):
             macros[d.sym.data] = d.text.data
@@ -60,6 +61,10 @@ def check_l1(module, header, tiles, l1_bytes=None):
     ends = [e.data for e in module.attributes['l1_ends'].data]
     bufs = [b.data for b in module.attributes['l1_end_bufs'].data]
     names = set().union(*(e.syms() for e in ends), *(s.extent.data.syms() for s in splits))
+    margin = evaluate('L1_MARGIN', macros, {})
+    if margin is None:
+        raise MgcError(None, f'L1_MARGIN ({macros["L1_MARGIN"]}) is not a compile-time integer')
+    budget = l1_bytes - margin
     for t in tiles:
         mesh = {'MESH_X_TILES': t, 'MESH_Y_TILES': t}
         m = {k: Const(v) for k, v in ((k, evaluate(k, macros, mesh)) for k in names | set(mesh)) if v is not None}
@@ -72,9 +77,10 @@ def check_l1(module, header, tiles, l1_bytes=None):
         vals = [e.subst(m).value() for e in ends]
         unknown = sorted({b for b, v in zip(bufs, vals) if v is None})
         used = max((v for v in vals if v is not None), default=0)
-        if used > l1_bytes:
+        if used > budget:
             raise MgcError(None, f'the L1 buffers of a tile take {"at least " if unknown else ""}{used} bytes on '
-                                 f'a {t}x{t} mesh, more than the {l1_bytes} bytes of L1')
+                                 f'a {t}x{t} mesh, more than the {budget} bytes of L1 ({l1_bytes} minus the '
+                                 f'L1_MARGIN of {margin})')
         if unknown:
             need = set().union(*(e.syms() for e, v in zip(ends, vals) if v is None)) - set(m)
             need = set().union(*(split_of.get(x, {x}) for x in need)) - set(m)

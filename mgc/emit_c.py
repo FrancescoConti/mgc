@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 
 from xdsl.dialects.builtin import ModuleOp
 
@@ -518,6 +519,9 @@ class Emitter:
         defs = [(o.sym.data, o.text.data) for o in self.m.ops if isinstance(o, ir.DefineOp)]
         if WAIT_MODE not in [n for n, _ in defs]:
             defs.append((WAIT_MODE, 'WFE'))
+        # the default L1_MARGIN, for the define()s that use it
+        if 'L1_MARGIN' not in [n for n, _ in defs] and any(re.search(r'\bL1_MARGIN\b', v) for _, v in defs):
+            defs.insert(0, ('L1_MARGIN', '(%d)' % devices.L1_MARGIN))
         out += [f'#define {n} {v}' for n, v in defs]
         out.append('')
         for k in self.kdefs.values():
