@@ -54,7 +54,7 @@ def main():
     ap.add_argument('--tiles', nargs='+', type=int, default=[], metavar='N',
                     help='mesh sides (make build tiles=N) on which to check that the L1 buffers of a tile fit')
     ap.add_argument('--l1-bytes', type=lambda x: int(x, 0), metavar='BYTES',
-                    help='L1 size of a tile for --tiles (default: L1_TILE_OFFSET - L1_BASE from the SDK\'s '
+                    help='L1 size of a tile for --tiles (default: L1_SIZE + 1 from the SDK\'s '
                          'tile_addr_map.h; an error if it cannot be found)')
     ap.add_argument('--print-ir-after', choices=PASS_NAMES, help='print the IR after this stage and stop')
     ap.add_argument('--print-ir-after-all', action='store_true', help='print the IR after every stage to stderr')

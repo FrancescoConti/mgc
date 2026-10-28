@@ -42,6 +42,16 @@ def tiles(module: ModuleOp) -> ir.TilesOp:
     raise MgcError(None, 'no tiles() region')
 
 
+def program_body(module: ModuleOp):
+    """The block the per-tile program runs in: the body of the outer blocking loop (a `for` that is the first
+    statement of the `tiles()` body and holds its tile splits, see `frontend.block()`), else the `tiles()` body."""
+    body = tiles(module).body.block
+    first = next((o for o in body.ops if not isinstance(o, ir.CommentOp)), None)
+    if isinstance(first, ir.ForOp) and any(isinstance(o, ir.SplitOp) for o in first.body.block.ops):
+        return first.body.block
+    return body
+
+
 def allocs(module: ModuleOp) -> List[ir.AllocOp]:
     """All `mg.alloc` ops (L1 buffers), in program order."""
     return [op for op in module.walk() if isinstance(op, ir.AllocOp)]

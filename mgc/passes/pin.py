@@ -7,9 +7,9 @@
 
 `L1.single_buffer(view, pin="qk")` pins a buffer to the loop `pipeline(n, name="qk")`
 (also `systolic()`); `pin=("a", "b")` to several loops, which must be back-to-back.
-Named loops sit directly in the `tiles()` body, where they split it into stretches:
-the stretch of loop k runs from the end of loop k - 1 to the start of loop k + 1, so
-the statements between two loops belong to both. A buffer pinned to loops lo..hi:
+Named loops sit directly in the `tiles()` body (or in the body of its outer blocking loop),
+where they split it into stretches: the stretch of loop k runs from the end of loop k - 1 to
+the start of loop k + 1, so the statements between two loops belong to both. A buffer pinned to loops lo..hi:
 
 * is used only in the stretches of lo..hi. A transfer or job uses its buffers until
   its `.wait()`;
@@ -34,7 +34,7 @@ from xdsl.passes import ModulePass
 
 from .. import ir
 from ..errors import MgcError
-from .common import alloc_of
+from .common import alloc_of, program_body
 
 
 def _issues(op):
@@ -61,8 +61,7 @@ class PinCheck(ModulePass):
         loops = [o for o in module.walk() if isinstance(o, ir.PipelineOp) and o.label is not None]
         if not pinned and not loops:
             return
-        tiles = next(o for o in module.walk() if isinstance(o, ir.TilesOp))
-        body = tiles.body.block
+        body = program_body(module)  # the tiles() body, or its outer blocking loop's
         top = list(body.ops)
         pos = {id(o): k for k, o in enumerate(top)}
 

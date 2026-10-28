@@ -678,11 +678,22 @@ class Frontend:
 
     def block(self, stmts, top=False):
         """Translate a list of statements into the current block.
-        `top` allows tile splits (only legal at the top of the `tiles()` body)."""
-        for s in stmts:
+        `top` allows tile splits (only legal at the top of the `tiles()` body, or of an outer blocking loop: a plain
+        `for b in range(n)` that is the first statement of the `tiles()` body, which repeats the whole body on blocks
+        of the problem, its splits being those of a block)."""
+        for k, s in enumerate(stmts):
             if self._is_split(s) and not top:
-                raise MgcError(s, 'tile splits must be at the top of the tiles() body')
-            self.stmt(s)
+                raise MgcError(s, 'tile splits must be at the top of the tiles() body (or of its outer blocking loop)')
+            if top and k == len([t for t in stmts[:k] if _is_doc(t)]) and self._is_blocking_loop(s):
+                self.flush_comments(s)
+                self.loop(s, top=True)
+                self.cursor = max(self.cursor, getattr(s, 'end_lineno', 0) or 0)
+            else:
+                self.stmt(s)
+
+    @staticmethod
+    def _is_blocking_loop(s):
+        return isinstance(s, ast.For) and _call_parts(s.iter)[1] == 'range'
 
     @staticmethod
     def _is_split(s):
@@ -1126,8 +1137,8 @@ class Frontend:
         return None
 
     # -- loops ---------------------------------------------------------------
-    def loop(self, s):
-        """Time loops inside the tile loop.
+    def loop(self, s, top=False):
+        """Time loops inside the tile loop (`top`: the outer blocking loop, see `block()`).
 
         - `for i in range(n)` / `range(a, b)` -> plain loop (`mg.for`);
         - `for i in pipeline(n, sync=SCOPE)` -> software pipeline over `n`
@@ -1166,7 +1177,7 @@ class Frontend:
 
             op = ir.ForOp.create(attributes={'var': StringAttr(var), 'lo': ir.E(lo), 'hi': ir.E(hi),
                                              'ctype': StringAttr(ctype)},
-                                 regions=[self.region(s.body, enter=enter)])
+                                 regions=[self.region(s.body, top=top, enter=enter)])
         else:
             if len(args) != 1:
                 raise MgcError(s, f'{fn}(n, ...) takes one trip count')

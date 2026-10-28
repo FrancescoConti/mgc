@@ -173,19 +173,16 @@ REDMULE_M_TILE = 16
 
 
 def sdk_l1_bytes() -> int:
-    """Bytes of a tile's L1 for the mgc buffers, from L1_BASE up to the next tile's L1
-    (L1_TILE_OFFSET) in the SDK's tile address map, e.g. 0x100000 - 0x20000 = 0xE0000.
-    Raises `MgcError` if the map or either macro is not found (then give mgcc --l1-bytes)."""
+    """Bytes of a tile's L1 for the mgc buffers, L1_SIZE + 1 in the SDK's tile address map (e.g. 0xDFFFF + 1 =
+    0xE0000, all the L1 from L1_BASE up to the next tile's), the one source of the L1 size: lower it there to use
+    less L1. Raises `MgcError` if the map or the macro is not found (then give mgcc --l1-bytes)."""
     path = _tile_addr_map()
     try:
         with open(path) as f:
             text = f.read()
     except OSError:
         raise MgcError(None, f'cannot read the L1 size: {path} not found (set MAGIA_SDK or give --l1-bytes)')
-    v = {}
-    for name in ('L1_BASE', 'L1_TILE_OFFSET'):
-        m = re.search(r'^\s*#define\s+%s\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?' % name, text, re.M)
-        if not m:
-            raise MgcError(None, f'cannot read the L1 size: no numeric {name} in {path} (give --l1-bytes)')
-        v[name] = int(m.group(1), 0)
-    return v['L1_TILE_OFFSET'] - v['L1_BASE']
+    m = re.search(r'^\s*#define\s+L1_SIZE\s+\(?\s*(0x[0-9a-fA-F]+|\d+)\s*\)?', text, re.M)
+    if not m:
+        raise MgcError(None, f'cannot read the L1 size: no numeric L1_SIZE in {path} (give --l1-bytes)')
+    return int(m.group(1), 0) + 1

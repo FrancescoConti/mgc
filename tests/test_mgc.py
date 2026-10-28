@@ -94,8 +94,8 @@ class Equivalence(unittest.TestCase):
     def test_os_schedule_order(self):
         c = _c(OS, 'mm_os.mgc')
         # prologue: program job 0 while its operands load, start it once they landed
-        pro = c[c.index('l2_addr_x,'):c.index('for (int i = 0')]
-        order = ['l2_addr_x,', 'l2_addr_w,', 'mg_redmule_gemm_enqueue', '&idma_evt_x);', '&idma_evt_w);',
+        pro = c[c.index('l2_addr_x +'):c.index('for (int i = 0')]
+        order = ['l2_addr_x +', 'l2_addr_w,', 'mg_redmule_gemm_enqueue', '&idma_evt_x);', '&idma_evt_w);',
                  '&idma_evt_y);', 'mg_redmule_gemm_commit_start']
         self.assertEqual(order, sorted(order, key=pro.index))
         # step: prefetch + program job i+1, commit it behind job i, wait job i
@@ -230,11 +230,11 @@ class Kernels(unittest.TestCase):
 class Extensibility(unittest.TestCase):
     """New iDMA modes and new HWPEs are descriptor changes only."""
 
-    X3 = ('X3 = l2("x_inp", (M, 4, N // 4), fp16)\nZ = l2(', '        redmule_evt = redmule.events(2)')
+    X3 = ('X3 = l2("x_inp", (M, 4, N // 4), fp16)\nZ = l2(', '            redmule_evt = redmule.events(2)')
 
     def _x3(self, alloc):
         s = _read(OS, 'mm_os_explicit.mgc').replace('Z = l2(', self.X3[0], 1).replace(
-            self.X3[1], self.X3[1] + '\n        q = L1.single_buffer(' + alloc + ')\n        idma.load(q, ' + alloc + ').wait()', 1)
+            self.X3[1], self.X3[1] + '\n            q = L1.single_buffer(' + alloc + ')\n            idma.load(q, ' + alloc + ').wait()', 1)
         return _c(OS, 'x.mgc', s)
 
     def test_rank_limit_from_capabilities(self):
@@ -360,8 +360,8 @@ def main():
 
     def test_uninit_outer_loop(self):
         # in a loop around the pipeline: only in its first iteration
-        c = _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('            ey = idma.load(y, Y[tile_h, tile_w])\n', ''))
-        self.assertIn('if (z == 0) {\n            mg_redmule_matmul_enqueue(', c)
+        c = _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('                ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])\n', ''))
+        self.assertIn('if (mb == 0 && z == 0) {\n                mg_redmule_matmul_enqueue(', c)
         self.assertEqual(c.count('mg_redmule_matmul_enqueue('), 1)
 
     def test_loaded_accumulator(self):
@@ -395,11 +395,11 @@ class Errors(unittest.TestCase):
         self.assertError('X[tile_h, 0:t_size], depth=2', 'X[tile_h, 0:t_size:2], depth=2', 'unit step')
 
     def test_l1_to_l1(self):
-        self.assertError('ey = idma.load(y, Y[tile_h, tile_w])', 'ey = idma.load(y, x[0])', 'L1->L1')
+        self.assertError('ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])', 'ey = idma.load(y, x[0])', 'L1->L1')
 
     def test_dma_shape_mismatch(self):
-        self.assertError('ex = idma.load(x[0], X[tile_h, 0:t_size])',
-                         'ex = idma.load(x[0], X[tile_h, 0:2 * t_size])', 'shape mismatch')
+        self.assertError('ex = idma.load(x[0], X[m0:m0 + tile_h.size, 0:t_size])',
+                         'ex = idma.load(x[0], X[m0:m0 + tile_h.size, 0:2 * t_size])', 'shape mismatch')
 
     def test_gemm_shape_mismatch(self):
         self.assertError('redmule.enqueue(x[0], w[0], y,', 'redmule.enqueue(w[0], x[0], y,', 'shapes do not match')
@@ -414,14 +414,15 @@ class Errors(unittest.TestCase):
         self.assertError('for z in range(N_ITERATIONS):', 'for z, zz in tiles():', 'outermost')
 
     def test_unwaited_event_reuse(self):
-        self.assertError('            ex.wait()\n            ew.wait()\n            ey.wait()\n',
-                         '            ew.wait()\n            ey.wait()\n'
-                         '            ex = idma.load(x[1], X[tile_h, t_size:2 * t_size])\n',
+        self.assertError('                ex.wait()\n                ew.wait()\n                ey.wait()\n',
+                         '                ew.wait()\n                ey.wait()\n'
+                         '                ex = idma.load(x[1], X[m0:m0 + tile_h.size, t_size:2 * t_size])\n',
                          'was not waited')
 
     def test_wait_never_issued(self):
-        self.assertError('            ex.wait()\n            ew.wait()\n            ey.wait()\n',
-                         '            ex.wait()\n            ex.wait()\n            ew.wait()\n            ey.wait()\n',
+        self.assertError('                ex.wait()\n                ew.wait()\n                ey.wait()\n',
+                         '                ex.wait()\n                ex.wait()\n                ew.wait()\n'
+                         '                ey.wait()\n',
                          'never issued')
 
     def test_bad_slot_offset(self):
@@ -900,8 +901,8 @@ def main():
 
     def test_range_loops_reuse_variable(self):
         src = _read(OS, 'mm_os_explicit.mgc')
-        a = src.index('            ey = idma.load(y, Y[tile_h, tile_w])\n')
-        b = src.index('            idma.store(Y[tile_h, tile_w], y).wait()\n')
+        a = src.index('                ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])\n')
+        b = src.index('                idma.store(Y[m0:m0 + tile_h.size, tile_w], y).wait()\n')
         b = src.index('\n', b) + 1
         c = _c(OS, 'x.mgc', src[:b] + src[a:b] + src[b:])
         loops = self.starts(c, 'for (int i = 0; i < timeslots; i++) {')
@@ -1158,7 +1159,7 @@ class L1Fit(unittest.TestCase):
 
     def test_sdk_l1_bytes(self):
         self.assertEqual(devices.sdk_l1_bytes(), 0xE0000)
-        self._sdk('#define L1_BASE        (0x00020000)\n#define L1_TILE_OFFSET (0x00400000)\n')
+        self._sdk('#define L1_BASE        (0x00020000)\n#define L1_SIZE        (0x003DFFFF)\n')
         self.assertEqual(devices.sdk_l1_bytes(), 0x3E0000)
         self._compile(1024, [2])
 
@@ -1202,7 +1203,7 @@ class L1Fit(unittest.TestCase):
         self._compile(512, [2], l1_bytes=0xE0000)
         self._compile(512, [])  # no check, the L1 size is not needed
         self._sdk('#define L1_BASE (0x00020000)\n')
-        with self.assertRaisesRegex(MgcError, 'no numeric L1_TILE_OFFSET'):
+        with self.assertRaisesRegex(MgcError, 'no numeric L1_SIZE'):
             self._compile(512, [2])
 
     def test_expression_defines(self):
