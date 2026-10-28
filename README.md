@@ -144,6 +144,11 @@ The body of the tile loop runs equally in each tile, in a variant of the SPMD (S
   of `h_max = ceil(E / MESH_Y_TILES)`. Edge tiles are clipped, and tiles with an empty block
   return 0. `h` can index a tensor dimension (start `h_max * y_id`, size `h`). `h.start` and
   `h.size` are expressions.
+- An **outer blocking loop**: a plain `for b in range(n)` as the first statement of the
+  `tiles()` body holds the rest of the test, splits included, and repeats it on `n` blocks of
+  the problem (e.g. `tests/magia/mgc/mm_os_mgc`: blocks of `M_BLK` output rows, split over the
+  mesh as the whole `M` was). Its body counts as the `tiles()` body for splits, named loops and
+  pins.
 
 ### Views and L1 buffers
 
@@ -309,10 +314,10 @@ for c in pipeline(sm_rows // SM_CHUNK, name="softmax"):
     ...
 ```
 
-Named loops go directly in the `tiles()` body, where they split it into **stretches**: the
-stretch of a loop runs from the end of the previous named loop to the start of the next one,
-so the statements between two loops belong to both. The `pin-check` pass makes sure that a
-pinned buffer
+Named loops go directly in the `tiles()` body (or its outer blocking loop), where they split it
+into **stretches**: the stretch of a loop runs from the end of the previous named loop to the
+start of the next one, so the statements between two loops belong to both. The `pin-check`
+pass makes sure that a pinned buffer
 
 - is used only in the stretch of its loop; a transfer or job uses its buffers until its
   `.wait()`;
