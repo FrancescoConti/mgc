@@ -627,7 +627,9 @@ Convolution, as an im2col GEMM with RedMulE for the products and Spatz for the i
 `scripts/mgc_sweep.py` runs the tests over a sweep of mesh sizes and problem sizes on gvsoc and
 compares cycles, MAC/cycle and the utilization of RedMulE, iDMA and Spatz. Sizes other than a
 test's defaults regenerate its `include/test.h` (golden generators) and `src/test.c` (mgcc) in
-place; the sources are restored at the end. Cycles are counted from tile 0's entry in `main`, not
+the job slot's own mirror of the SDK (`<out>/jobs/<k>/sdk`, the test folders and `tile_config.h`
+copied, the rest linked), so that `--jobs` configurations are generated, built and simulated in
+parallel and the SDK is never modified. Cycles are counted from tile 0's entry in `main`, not
 from the crt0 init.
 
 ```sh

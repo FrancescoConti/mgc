@@ -9,13 +9,14 @@ compare cycles, MAC/cycle and the utilization of RedMulE, iDMA and Spatz.
 
 The runs are ordered by mesh side; gvsoc is rebuilt for each mesh side with
     make gvsoc tiles=<N> pulp_cluster=0
-and each configuration is built, one at a time, and run with
+and each configuration is built and run with
     make build tiles=<N> test=<test> pulp_cluster=0
     make run_profiling platform=gvsoc tiles=<N> test=<test> pulp_cluster=0
-and measured on gvsoc_work/trace.perfetto-trace. With --jobs J, up to J runs of the same mesh
-side simulate in parallel, each with its own CMAKE_BUILDDIR and GVSOC_WORK_DIR (job 0: build/
-and gvsoc_work/, the others in <out>/jobs/<k>/); builds stay serial, as they share the test
-sources. Metrics:
+and measured on gvsoc_work/trace.perfetto-trace. With --jobs J, up to J configurations are prepared,
+built and simulated in parallel, each in a job slot <out>/jobs/<k>/ with its own CMAKE_BUILDDIR,
+GVSOC_WORK_DIR and mirror of the SDK (sdk/: the test folders and tile_config.h copied, every other
+entry a link to the SDK), in which its sources are generated and built: the SDK is never written.
+The golden data of all the configurations are generated first, J at a time, into the cache. Metrics:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
     without crt0 init and without tile 0's final check(); for mm and conv tests, where each tile
     checks its own output tile, to the end of the last iDMA store (L1->L2)
@@ -31,8 +32,7 @@ sources. Metrics:
 Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from include/test.h,
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
-place. The test sources are restored at the end (also on Ctrl-C, or on the next start if the
-script was killed). D and H are written to test.h but not used by the current attention kernels.
+the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
 
 Sweep: a JSON file with a list of groups, each the cartesian product of its lists (missing
 parameters take each test's default), e.g.
@@ -76,6 +76,7 @@ Run it from anywhere: the magia-sdk checkout is $MAGIA_SDK, or the parent of thi
 """
 
 import argparse
+import copy
 import csv
 import datetime
 import glob
@@ -211,6 +212,13 @@ class Test:
         self.defaults = self._defaults()
         self.goldens = [int(t) for t in re.findall(r'^#(?:el)?if MESH_X_TILES == (\d+)', read(self.header), re.M)]
 
+    def at(self, root):
+        """This test with its source paths under `root`, a mirror of the SDK (see mirror_sdk())."""
+        t = copy.copy(self)
+        for a in ('dir', 'header', 'test_c', 'gen', 'mgc'):
+            setattr(t, a, os.path.join(root, os.path.relpath(getattr(self, a), REPO)))
+        return t
+
     def _defaults(self):
         h, src = read(self.header), read(self.mgc)
         d = {}
@@ -294,7 +302,7 @@ def list_tests():
 
 
 # --------------------------------------------------------------------------------------------
-# In-place regeneration of test.h / test.c, with backup and restore
+# Backups of an earlier version, which regenerated test.h / test.c in the SDK (only recover() is used now)
 # --------------------------------------------------------------------------------------------
 
 class Sources:
@@ -429,14 +437,16 @@ def pregenerate(runs, args, log):
     return errors
 
 
-def generate(test, cfg, tiles, args, srcs, log):
-    """Write test.h, the .mgc defines and test.c for cfg; return None or an error string."""
-    for p in (test.header, test.test_c, test.mgc):
-        srcs.save(p)
-    # restart from the originals: a previous configuration may have changed them
-    for p in (test.header, test.test_c, test.mgc):
-        shutil.copy2(srcs.saved[p], p)
+def pristine(test, orig):
+    """Copy the committed test.h, test.c and .mgc of `orig` (the test in the SDK) over those of `test` (the
+    same test in a slot's mirror), which an earlier configuration of the slot may have changed."""
+    for a in ('header', 'test_c', 'mgc'):
+        shutil.copy2(getattr(orig, a), getattr(test, a))
 
+
+def generate(test, cfg, tiles, args, log):
+    """Write test.h, the .mgc defines and test.c for cfg into `test`'s folder (a slot's mirror, see
+    mirror_sdk(), restored from the SDK by pristine() first); return None or an error string."""
     why = generate_golden(test, cfg, tiles, args, log)
     if why:
         return why
@@ -453,7 +463,7 @@ def generate(test, cfg, tiles, args, srcs, log):
 def mgcc(test, tiles, args, out, log):
     """Compile the test's .mgc to `out`, checking that its L1 buffers fit on a `tiles` x `tiles`
     mesh (its warnings, e.g. buffers it could not size, go to `log`); the reason it failed, or None."""
-    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '-o', out,
+    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '--header', test.header, '-o', out,
                         '--tiles', str(tiles)], cwd=REPO, capture_output=True, text=True)
     if r.returncode:
         return 'mgcc failed: ' + ' '.join(r.stderr.split())[:200]
@@ -471,11 +481,11 @@ PROCS = set()  # running make process groups, killed on interrupt
 STOP = threading.Event()
 
 
-def make(cmd, timeout=None, env=None):
-    """Run cmd in its own process group, with env added to the environment; return (return
-    code, output), return code None if killed after timeout seconds."""
-    env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(REPO, 'sourceme.sh')) else ''
-    p = subprocess.Popen(['bash', '-c', env_setup + cmd], cwd=REPO, env={**os.environ, **(env or {})},
+def make(cmd, timeout=None, env=None, cwd=REPO):
+    """Run cmd in `cwd` (the SDK, or a slot's mirror of it) in its own process group, with env added to the
+    environment; return (return code, output), return code None if killed after timeout seconds."""
+    env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(cwd, 'sourceme.sh')) else ''
+    p = subprocess.Popen(['bash', '-c', env_setup + cmd], cwd=cwd, env={**os.environ, **(env or {})},
                          stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, errors='replace', start_new_session=True)
     PROCS.add(p)
@@ -500,11 +510,38 @@ def kill(p):
 
 
 def slot_dirs(out, slot):
-    """(CMAKE_BUILDDIR, GVSOC_WORK_DIR) of a parallel job slot."""
-    if slot == 0:
-        return os.path.join(REPO, 'build'), os.path.join(REPO, 'gvsoc_work')
+    """(CMAKE_BUILDDIR, GVSOC_WORK_DIR, mirror of the SDK) of a parallel job slot."""
     d = os.path.join(out, 'jobs', str(slot))
-    return os.path.join(d, 'build'), os.path.join(d, 'gvsoc_work')
+    return os.path.join(d, 'build'), os.path.join(d, 'gvsoc_work'), os.path.join(d, 'sdk')
+
+
+# What a build writes into the source tree: the test's sources (generated per configuration) and tile_config.h
+# (written by make build for the mesh side). A slot's mirror copies them and links everything else.
+MIRROR_COPIES = [os.path.join('targets', 'magia', 'include', 'addr_map')]
+
+
+def mirror_sdk(root, tests):
+    """Make `root` a mirror of the SDK in which a slot builds without touching the SDK or the other slots:
+    the folders of `tests` and MIRROR_COPIES are copied, the folders on the way to them recreated, and every
+    other entry is a symbolic link to the SDK's. The CMake files reach the shared sources (kernels, mglib,
+    targets) through relative paths, which resolve through the links."""
+    copies = MIRROR_COPIES + [os.path.relpath(t.dir, REPO) for t in tests]
+
+    def visit(rel):
+        os.makedirs(os.path.join(root, rel), exist_ok=True)
+        for name in os.listdir(os.path.join(REPO, rel)):
+            r = os.path.join(rel, name)
+            src, dst = os.path.join(REPO, r), os.path.join(root, r)
+            if os.path.lexists(dst):
+                continue
+            if r in copies:
+                shutil.copytree(src, dst, symlinks=True)
+            elif any(c.startswith(r + os.sep) for c in copies):
+                visit(r)
+            else:
+                os.symlink(src, dst)
+
+    visit('')
 
 
 def target_params(args, hw):
@@ -561,15 +598,16 @@ def build_gvsoc(tiles, hw, logf, args):
     return rc
 
 
-def build_test(test, tiles, build, logf):
+def build_test(test, tiles, build, logf, root=REPO):
     shutil.rmtree(build, ignore_errors=True)
     cmd = 'make build tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s' % (tiles, test.target, build)
-    rc, out = make(cmd)
+    rc, out = make(cmd, cwd=root)
     write(logf, '$ ' + cmd + '\n' + out)
     return rc
 
 
-def run_test(test, tiles, hw, build, work, logf, args):
+def run_test(test, tiles, hw, build, work, logf, args, root=REPO):
+    """make run or run_profiling of a built test, from `root` (the SDK or a slot's mirror)."""
     cmd = ('make %s platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s%s'
            % ('run' if args.no_profile else 'run_profiling', tiles, test.target, build, work, gvsoc_opts(args, hw)))
     env = {}
@@ -582,7 +620,7 @@ def run_test(test, tiles, hw, build, work, logf, args):
         extra += ['--or', 'spatz_busy=task,ara.active', '--keep', LIGHT_KEEP]
         env = {'profile_events': ' '.join(PROFILE_EVENTS), 'GVSOC2PERFETTO_INCLUDE': PERFETTO_INCLUDE,
                'GVSOC2PERFETTO_EXTRA': ' '.join(map(shlex.quote, extra))}
-    rc, out = make(cmd, args.timeout, env)
+    rc, out = make(cmd, args.timeout, env, cwd=root)
     with open(logf, 'a') as f:
         f.write(''.join('$ export %s=%s\n' % (k, shlex.quote(v)) for k, v in env.items()))
         f.write('$ ' + cmd + '\n' + out)
@@ -861,10 +899,48 @@ def expand(groups, tests):
     return runs
 
 
-def simulate(t, cfg, tiles, hw, row, rdir, slot, build, work, t0, tag, args, rep, free):
-    """Run a built configuration in job slot `slot`, measure it and add its row."""
+def run_one(t, cfg, tiles, hw, row, rdir, t0, tag, args, rep, free, out, tests):
+    """One configuration, in parallel with the others: in a free job slot, its sources (generated, or the committed
+    ones) and mgcc in the slot's mirror of the SDK (made on its first use, see mirror_sdk(); `tests` are the tests
+    of the sweep), the build, then simulate(). The SDK itself is never written."""
+    slot = free.get()
     try:
-        rc, outp = run_test(t, tiles, hw, build, work, os.path.join(rdir, 'make.log'), args)
+        if STOP.is_set():
+            return
+        build, work, root = slot_dirs(out, slot)
+        if not os.path.exists(root):
+            mirror_sdk(root, tests)
+        ts = t.at(root)
+        pristine(ts, t)
+        if t.needs_regen(cfg, tiles):
+            why = generate(ts, cfg, tiles, args, rep.log)
+        else:
+            why = mgcc(ts, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
+        if why:
+            row['status'] = 'SKIP'
+            rep.log('%s skipped: %s' % (tag, why))
+        elif build_test(ts, tiles, build, os.path.join(rdir, 'make.log'), root):
+            row['status'] = 'BUILD/RUN FAIL'
+            rep.log('%s build failed, see %s' % (tag, rdir))
+        else:
+            if args.jobs > 1:
+                rep.log('%s simulating in job %d' % (tag, slot))
+            simulate(ts, cfg, tiles, hw, row, rdir, build, work, t0, tag, args, rep, root)
+            return
+    except Exception as e:
+        if STOP.is_set():
+            return
+        row['status'] = 'BUILD/RUN FAIL'
+        rep.log('%s failed: %r' % (tag, e))
+    finally:
+        free.put(slot)
+    rep.add(row)
+
+
+def simulate(t, cfg, tiles, hw, row, rdir, build, work, t0, tag, args, rep, root=REPO):
+    """Run a built configuration (from `root`, its slot's mirror), measure it and add its row."""
+    try:
+        rc, outp = run_test(t, tiles, hw, build, work, os.path.join(rdir, 'make.log'), args, root)
         if STOP.is_set():
             return
         kills, errs = parse_run(outp)
@@ -922,7 +998,6 @@ def simulate(t, cfg, tiles, hw, row, rdir, slot, build, work, t0, tag, args, rep
         for f in (trace, os.path.join(work, 'all.vcd')):
             if os.path.exists(f):
                 os.remove(f)
-        free.put(slot)
     rep.add(row)
 
 
@@ -1001,8 +1076,7 @@ def main():
     args.cache = os.path.abspath(args.cache)
     os.makedirs(os.path.join(out, 'runs'), exist_ok=True)
     rep = Report(out)
-    Sources.recover(rep.log)
-    srcs = Sources(rep.log)
+    Sources.recover(rep.log)  # sources left modified by an interrupted sweep of an earlier version
     signal.signal(signal.SIGTERM, on_sigterm)
     rep.log('mgc sweep: %d configurations, output in %s' % (len(runs), out))
     if args.no_profile and args.full_traces:
@@ -1011,6 +1085,7 @@ def main():
     if not args.dry_run:
         pregenerate(runs, args, rep.log)
 
+    sweep_tests = list({id(r[0]): r[0] for r in runs}.values())  # copied into the slots' mirrors
     pool = ThreadPoolExecutor(args.jobs)
     free = Queue()  # job slots not running a simulation
     for k in range(args.jobs):
@@ -1037,12 +1112,6 @@ def main():
             key = (tiles, tuple(hw[p] for p in HW_PARAMS))
             t0 = time.time()
             why = hw_check(hw) or t.check(cfg, tiles)
-            if why is None and t.needs_regen(cfg, tiles):
-                why = generate(t, cfg, tiles, args, srcs, rep.log)
-            elif why is None:
-                for p in list(srcs.saved):  # back to the committed sources
-                    shutil.copy2(srcs.saved[p], p)
-                why = mgcc(t, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
             if why:
                 row['status'] = 'SKIP'
                 rep.log('  skipped: ' + why)
@@ -1050,20 +1119,10 @@ def main():
                 row['status'] = 'GVSOC FAIL'
                 rep.log('  gvsoc build failed (rc=%d), see %s' % (gvsoc_rc[key], gvsoc_log))
             else:
-                slot = free.get()
-                build, work = slot_dirs(out, slot)
-                rc = build_test(t, tiles, build, os.path.join(rdir, 'make.log'))
-                if rc:
-                    free.put(slot)
-                    row['status'] = 'BUILD/RUN FAIL'
-                    rep.log('  build failed (rc=%d), see %s' % (rc, rdir))
-                else:
-                    if args.jobs > 1:
-                        rep.log('  simulating in job %d' % slot)
-                    # the sources may change from now on: the simulation only needs the build
-                    futures.append(pool.submit(simulate, t, cfg, tiles, hw, row, rdir, slot, build, work, t0,
-                                               '  ' + tag if args.jobs > 1 else ' ', args, rep, free))
-                    continue
+                # sources, mgcc, build and simulation in a job slot, in its own mirror of the SDK
+                futures.append(pool.submit(run_one, t, cfg, tiles, hw, row, rdir, t0, '  ' + tag, args, rep, free,
+                                           out, sweep_tests))
+                continue
             rep.add(row)
         wait(futures)
     except KeyboardInterrupt:
@@ -1073,7 +1132,6 @@ def main():
         rep.log('interrupted')
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-        srcs.restore()
     if not STOP.is_set():
         shutil.rmtree(os.path.join(out, 'jobs'), ignore_errors=True)
 
