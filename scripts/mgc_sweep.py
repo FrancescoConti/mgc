@@ -24,12 +24,12 @@ The golden data of all the configurations are generated first, J at a time, into
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
     plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa,
     3*S*D*I for ffn (gate, up and down projections), 2*S*D*I for ffn_gelu (up and down projections),
-    IMG_H*IMG_W*COUT*KS*KS*CIN for conv
+    OH*OW*COUT*KS*KS*CIN for conv (the output OH x OW: IMG_H x IMG_W at STRIDE 1)
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
 
-Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS from include/test.h,
+Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS, STRIDE from include/test.h,
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
 default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
@@ -119,12 +119,14 @@ SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
-# convolutions (conv_*): image IMG_H x IMG_W, CIN -> COUT channels, KS x KS kernel
+# convolutions (conv_*): image IMG_H x IMG_W, CIN -> COUT channels, KS x KS kernel, stride STRIDE (padding (KS - 1) / 2;
+# only the tests whose test.h has CONV_S)
 PARAMS = ['S', 'D', 'P', 'H', 'HKV', 'I', 'H_NB', 'PRJ_NB', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'M_NB', 'T_SIZE',
-          'IMG_H', 'IMG_W', 'CIN', 'COUT', 'KS']
+          'IMG_H', 'IMG_W', 'CIN', 'COUT', 'KS', 'STRIDE']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS', 'HKV': 'NUM_KV_HEADS',
                   'I': 'FFN_SIZE', 'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE',
-                  'IMG_H': 'CONV_H', 'IMG_W': 'CONV_W', 'CIN': 'CONV_CIN', 'COUT': 'CONV_COUT', 'KS': 'CONV_K'}
+                  'IMG_H': 'CONV_H', 'IMG_W': 'CONV_W', 'CIN': 'CONV_CIN', 'COUT': 'CONV_COUT', 'KS': 'CONV_K',
+                  'STRIDE': 'CONV_S'}
 # blocking factors of the .mgc, outermost first (the order in which choose_blocks() makes them the largest that fit):
 # blocking factors of the .mgc: block counts (H_NB blocks of heads of the attention tests, their projections on
 # PRJ_NB blocks of rows, M_NB blocks of output rows of the mm tests, see choose_blocks()), the timeslots of T_SIZE
@@ -181,7 +183,7 @@ TABLE = [
     ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('HKV', 'HKV', '{}'), ('HNB', 'H_NB', '{}'), ('PNB', 'PRJ_NB', '{}'), ('I', 'I', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
     ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
     ('MNB', 'M_NB', '{}'), ('T', 'T_SIZE', '{}'), ('IH', 'IMG_H', '{}'), ('IW', 'IMG_W', '{}'), ('Cin', 'CIN', '{}'),
-    ('Cout', 'COUT', '{}'), ('KS', 'KS', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
+    ('Cout', 'COUT', '{}'), ('KS', 'KS', '{}'), ('St', 'STRIDE', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
     ('RedMulE%', 'redmule_pct', '{:.1f}'), ('iDMA%', 'idma_pct', '{:.1f}'),
     ('in%', 'idma_in_pct', '{:.1f}'), ('out%', 'idma_out_pct', '{:.1f}'),
@@ -270,7 +272,8 @@ class Test:
         if self.kind == 'ffn':
             return (2 if self.name.startswith('ffn_gelu') else 3) * cfg['S'] * cfg['D'] * cfg['I']
         if self.kind == 'conv':
-            return cfg['IMG_H'] * cfg['IMG_W'] * cfg['COUT'] * cfg['KS'] * cfg['KS'] * cfg['CIN']
+            oh, ow = conv_out(cfg)
+            return oh * ow * cfg['COUT'] * cfg['KS'] * cfg['KS'] * cfg['CIN']
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
         if self.kind not in ('mhsa', 'gqa'):
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
@@ -294,11 +297,13 @@ class Test:
         if self.kind == 'ffn' and cfg['I'] % tiles:
             return 'I must be a multiple of tiles'
         if self.kind == 'conv':
-            if cfg['KS'] % 2 == 0 or cfg['IMG_H'] < cfg['KS']:
-                return 'KS must be odd and at most IMG_H'
-            for n in (cfg['IMG_H'], cfg['COUT']):  # output rows over the mesh rows, channels over its columns
+            if cfg['KS'] % 2 == 0 or cfg['IMG_H'] < cfg['KS'] or cfg['IMG_W'] < cfg['KS']:
+                return 'KS must be odd and at most IMG_H and IMG_W'
+            if (cfg.get('STRIDE') or 1) != 1 and self.defaults['STRIDE'] is None:
+                return 'this test has stride 1 only'
+            for n in (conv_out(cfg)[0], cfg['COUT']):  # output rows over the mesh rows, channels over its columns
                 if n - (tiles - 1) * -(-n // tiles) < 1:
-                    return 'IMG_H and COUT must leave every tile some rows and channels'
+                    return 'the output rows and COUT must leave every tile some rows and channels'
         if self.kind == 'gqa' and cfg['H'] % cfg['HKV']:
             return 'H must be a multiple of HKV'
         if cfg['H_NB'] and cfg['H'] % cfg['H_NB']:
@@ -373,6 +378,12 @@ class Sources:
         shutil.rmtree(BACKUP, ignore_errors=True)
 
 
+def conv_out(cfg):
+    """Output rows and columns of a conv configuration: padding (KS - 1) / 2, stride STRIDE (1 if not given)."""
+    s, k = cfg.get('STRIDE') or 1, cfg['KS']
+    return tuple((n + 2 * ((k - 1) // 2) - k) // s + 1 for n in (cfg['IMG_H'], cfg['IMG_W']))
+
+
 def golden_key(test, cfg, tiles, l1=None):
     """Name of the cache folder of the test.h of cfg (`l1`: see l1_kib())."""
     if test.kind == 'mm':
@@ -380,8 +391,9 @@ def golden_key(test, cfg, tiles, l1=None):
     elif test.kind == 'ffn':
         key = '%s_S%s_D%s_I%s_T%d' % (test.name, cfg['S'], cfg['D'], cfg['I'], tiles)
     elif test.kind == 'conv':
-        key = '%s_H%s_W%s_CI%s_CO%s_K%s_T%d' % (test.name, cfg['IMG_H'], cfg['IMG_W'], cfg['CIN'], cfg['COUT'],
-                                                 cfg['KS'], tiles)
+        key = '%s_H%s_W%s_CI%s_CO%s_K%s%s_T%d' % (test.name, cfg['IMG_H'], cfg['IMG_W'], cfg['CIN'], cfg['COUT'],
+                                                   cfg['KS'], '_S%d' % cfg['STRIDE'] if (cfg.get('STRIDE') or 1) != 1
+                                                   else '', tiles)
     else:
         # the flat_attn tests share one generator; mhsa/gqa tests have their own (e.g. the _masked ones)
         key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind if test.kind == 'flat_attn' else test.name,
@@ -426,6 +438,8 @@ def generate_golden(test, cfg, tiles, args, log, l1=None):
         elif test.kind == 'conv':
             cmd = [args.gen_python, test.gen, '--h', cfg['IMG_H'], '--w', cfg['IMG_W'], '--cin', cfg['CIN'],
                    '--cout', cfg['COUT'], '--ksize', cfg['KS'], '--tiles', tiles, '--inc_dir', tmp]
+            if (cfg.get('STRIDE') or 1) != 1:
+                cmd += ['--stride', cfg['STRIDE']]
         else:
             # writes the test's own include/test.h (restored at the end): not in pregenerate()
             cmd = [args.gen_python, os.path.join(test.dir, 'gen_golden.py'),
