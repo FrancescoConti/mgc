@@ -628,6 +628,7 @@ Convolution, as an im2col GEMM with RedMulE for the products and Spatz for the i
 |---|---|
 | `conv_im2col` | `CONV_K` x `CONV_K` convolution (odd, default 3), stride 1, "same" zero padding, HWC: per block of output pixels, a 4-stage pipeline of the input rows by iDMA, the im2col (with the padding) on Spatz (`args=` of `l1_kernel` give it the row and column), the GEMM with the resident weights on RedMulE and the output store by iDMA |
 | `conv_im2col_opt` | `conv_im2col` with the im2col shared by the tiles of a mesh row: each builds its part of the block on Spatz, in tasks of about 12 KiB, and multicasts each one to the others while Spatz builds the next; a row barrier ends every pipeline step |
+| `conv_im2col_partial` | the same convolution (any stride) with a partial im2col, expanded along `kx` only and once per input row, without Spatz: per block of output columns, a 3-stage pipeline of the expanded input rows loaded by iDMA straight from L2 (one 2-D transfer per row, the patch rows overlapping in L2) into a ring of `K + S` rows in L1, `K` RedMulE jobs per output row (inner dimension `K x CIN`) accumulating in the output block, and the output store by iDMA; the tiles exchange nothing |
 
 ## Sweeps: `scripts/`
 
