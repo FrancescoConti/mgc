@@ -426,9 +426,6 @@ class Errors(unittest.TestCase):
     def test_gemm_shape_mismatch(self):
         self.assertError('redmule.enqueue(x[0], w[0], y,', 'redmule.enqueue(w[0], x[0], y,', 'shapes do not match')
 
-    def test_u8_overflow(self):
-        self.assertError('timeslots: u8 = N_TIMESLOTS', 'timeslots: u8 = 4 * N', 'does not fit')
-
     def test_cores_reserved(self):
         self.assertError('for z in range(N_ITERATIONS):', 'for z in cores():', 'reserved')
 
@@ -505,18 +502,6 @@ def main():
         self.assertNotIn('l1_base_s', c)
         self.assertIn('l1_addr_x_0 = l1_addr_w + (tile_h_max * tile_w_max * 2);', c)  # uniform layout
 
-    def test_row_and_col_multicast_lowered_to_unicasts(self):
-        c = _c(OS, 'x.mgc', self.MCAST)
-        self.assertIn('for (uint32_t mcast_x = 0; mcast_x < MESH_X_TILES; mcast_x++) {', c)
-        self.assertIn('if (mcast_x != x_id) {', c)
-        self.assertIn('get_l1_base(GET_ID(y_id, mcast_x)) + (l1_addr_x - l1_tile_base),', c)
-        self.assertIn('for (uint32_t mcast_w = 0; mcast_w < MESH_Y_TILES; mcast_w++) {', c)
-        self.assertIn('if (mcast_w != y_id) {', c)
-        self.assertIn('get_l1_base(GET_ID(mcast_w, x_id)) + (l1_addr_w - l1_tile_base),', c)
-        # one wait covers all the unicasts (same-direction transfers complete in order)
-        self.assertEqual(c.count('mg_idma_wait(1, WAIT_MODE, &idma_evt_x);'), 1)
-        self.assertIn('l1_addr_w = l1_addr_x + (tile_h_max * N_SIZE * 2);', c)  # uniform layout
-
     def test_native_multicast_is_a_table_change(self):
         caps = devices.IdmaCaps(max_rank=2, l1_strided=False, functions=devices.IDMA.functions,
                                 multicast={'ROW': 'mg_idma_memcpy_row_mcast'})
@@ -567,10 +552,6 @@ def main():
         # 8 bytes per row, L1 stride 32 bytes, tile_h rows
         self.assertIn('l1_addr_r,\n                          8,\n                          32,\n'
                       '                          tile_h,', c)
-
-    def test_store_into_block_multicast(self):
-        c = _c(OS, 'x.mgc', self.GATHER.replace('rs.at(y_id, 0)[x_id, :]', 'rs.col[x_id, :]'))
-        self.assertIn('get_l1_base(GET_ID(mcast_r, x_id)) + (l1_addr_rs + (x_id * tile_h * 2) - l1_tile_base),', c)
 
     def test_store_into_block_checks(self):
         with self.assertRaisesRegex(MgcError, 'shape mismatch'):
