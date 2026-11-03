@@ -5,6 +5,7 @@
 # Francesco Conti <f.conti@unibo.it>
 """mgc compiler tests: mgc/.venv/bin/python -m unittest discover -s mgc/tests"""
 
+import dataclasses
 import os
 import re
 import shutil
@@ -86,13 +87,36 @@ class Golden(unittest.TestCase):
         self.check(MM, 'mm_matmul.mgc')
 
 
+def _os_2stage():
+    """mm_os.mgc with its loads in the stage of the job (2 stages), the schedule of mm_os_explicit.mgc."""
+    src = _read(OS, 'mm_os.mgc')
+    for old, new in (('depth=3)', 'depth=2)'),
+                     ('                    with stage(1):\n                        redmule.enqueue', '                        redmule.enqueue'),
+                     ('                    with stage(2):\n                        redmule_evt[i].wait()',
+                      '                    with stage(1):\n                        redmule_evt[i].wait()')):
+        assert old in src, old
+        src = src.replace(old, new)
+    return src
+
+
 class Equivalence(unittest.TestCase):
 
     def test_os_pipelined_equals_explicit(self):
-        self.assertEqual(_code(_c(OS, 'mm_os.mgc')), _code(_c(OS, 'mm_os_explicit.mgc')))
+        self.assertEqual(_code(_c(OS, 'x.mgc', _os_2stage())), _code(_c(OS, 'mm_os_explicit.mgc')))
+
+    def test_os_loads_one_step_ahead(self):
+        c = _c(OS, 'mm_os.mgc')
+        self.assertIn('x               stages 0..2  depth 3', c)
+        self.assertIn('idma_evts_x_in  stages 0..1  depth 2', c)
+        # step: load the operands of iteration i + 1, program job i, commit it once its operands (loaded in the
+        # previous step) have landed, wait job i - 1
+        loop = c[c.index('for (int i = 0'):]
+        order = ['x_pt_next,', 'w_pt_next,', 'mg_redmule_gemm_enqueue', 'idma_evts_x_in_curr);',
+                 'idma_evts_w_in_curr);', 'mg_redmule_gemm_commit_start', 'redmule_evt_prev);']
+        self.assertEqual(order, sorted(order, key=loop.index))
 
     def test_os_schedule_order(self):
-        c = _c(OS, 'mm_os.mgc')
+        c = _c(OS, 'x.mgc', _os_2stage())
         # prologue: program job 0 while its operands load, start it once they landed
         pro = c[c.index('l2_addr_x +'):c.index('for (int i = 0')]
         order = ['l2_addr_x +', 'l2_addr_w,', 'mg_redmule_gemm_enqueue', '&idma_evt_x);', '&idma_evt_w);',
@@ -123,9 +147,11 @@ class Systolic(unittest.TestCase):
         for g in ('if (pt < (timeslots - 1)) {', 'if (pt > 0) {', 'if (pt < timeslots) {'):
             self.assertIn(g, c)
         # y is sent by the tile above: the job is committed one stage after the loads (valid
-        # after the barrier), and waited in the same step (lag=0)
+        # after the barrier), once they have landed, and waited in the same step (lag=0)
         enq = c.index('mg_redmule_gemm_enqueue')
-        self.assertEqual(c[c.rfind('if (', 0, enq):].split('\n')[0], 'if (pt < timeslots) {')
+        wx = c.index('mg_idma_wait(0, WAIT_MODE, idma_evts_x_in_curr);')
+        self.assertLess(wx, enq)
+        self.assertEqual(c[c.rfind('if (pt', 0, wx):].split('\n')[0], 'if (pt < timeslots) {')
         self.assertLess(c.index('mg_redmule_gemm_commit_start'), c.index('mg_redmule_wait(WAIT_MODE, &redmule_evt);'))
         self.assertEqual(c.count('fsync_sync_global();'), 2)  # prologue + every step
 
@@ -146,11 +172,22 @@ class Systolic(unittest.TestCase):
         self.assertNotIn('fsync_sync_global', c)
 
     def test_event_storage_split_only_when_overlapping(self):
-        ws = _c(WS, 'mm_ws.mgc')  # y is loaded (top row) while the previous block is sent
-        self.assertIn('idma_evt_y_in', ws)
-        self.assertIn('idma_evt_y_out', ws)
+        ws = _c(WS, 'mm_ws.mgc')  # y is loaded (top row) one step ahead, while the previous block is sent
+        self.assertIn('mg_event_t idma_evts_y_in_0, idma_evts_y_in_1;', ws)
+        self.assertIn('mg_event_t idma_evt_w, idma_evt_y;', ws)
         os_ = _c(OS, 'mm_os.mgc')  # y load and store never overlap
-        self.assertIn('mg_event_t idma_evt_y, idma_evt_x, idma_evt_w;', os_)
+        self.assertIn('mg_event_t idma_evt_y;', os_)
+        self.assertNotIn('idma_evt_y_', os_)
+
+    def test_loads_waited_next_step(self):
+        for d, name in ((WS, 'mm_ws.mgc'), (IS, 'mm_is.mgc')):
+            c = _c(d, name)
+            self.assertIn('idma_evts_y_in  stages 0..1  depth 2', c)
+            self.assertIn('mg_idma_wait(0, WAIT_MODE, idma_evts_y_in_curr);', c)
+        # waited in the stage of its issue on some tiles only: still an error
+        src = _read(WS, 'mm_ws.mgc').replace('                    if y_id == 0:\n                        ey.wait()\n', '')
+        with self.assertRaisesRegex(MgcError, 'never waited'):
+            _c(WS, 'x.mgc', src)
 
     def test_explicit_ws_compiles_with_rotate_and_continue(self):
         c = _c(WS, 'mm_ws_explicit.mgc')
@@ -361,7 +398,7 @@ def main():
     def test_uninit_outer_loop(self):
         # in a loop around the pipeline: only in its first iteration
         c = _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('                ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])\n', ''))
-        self.assertIn('if (mb == 0 && z == 0) {\n                mg_redmule_matmul_enqueue(', c)
+        self.assertRegex(c, r'if \(mb == 0 && z == 0 && i == 0\) \{\s*mg_redmule_matmul_enqueue\(')
         self.assertEqual(c.count('mg_redmule_matmul_enqueue('), 1)
 
     def test_loaded_accumulator(self):
@@ -815,6 +852,27 @@ def main():
                           ('            with stage(1):\n                ev[i].wait()\n',
                            '            with stage(2):\n                ev[i].wait()\n')],
                          'redmule holds 2 jobs, but 3 would be in flight')
+
+    # the loads issued one stage before the job that reads them, as an HWPE job: in flight across a step
+    EARLY = [('X[0:t_size, :], depth=2', 'X[0:t_size, :], depth=3'),
+             ('Y[0:t_size, tile_w], depth=3', 'Y[0:t_size, tile_w], depth=4'),
+             ('                redmule.enqueue(', '            with stage(1):\n                redmule.enqueue('),
+             ('            with stage(1):\n                ev[i].wait()\n            with stage(2):\n',
+              '            with stage(2):\n                ev[i].wait()\n            with stage(3):\n')]
+
+    def test_idma_issued_earlier(self):
+        c = self.c(*self.EARLY)
+        self.assertIn('idma_evts_x_in  stages 0..1  depth 2', c)
+        loop = c[c.index('for (int i = 0'):]
+        # the loads of iteration i + 1 go before the job of iteration i, which waits those of iteration i
+        order = ['x_pt_next,', 'mg_redmule_gemm_enqueue', 'idma_evts_x_in_curr);', 'mg_redmule_gemm_commit_start']
+        self.assertEqual(order, sorted(order, key=loop.index))
+
+    def test_idma_queue_depth(self):
+        # two loads per step, each pending into the next step: 4 at once
+        with mock.patch.object(devices, 'IDMA', dataclasses.replace(devices.IDMA, queue_depth=3)):
+            self.assertError(self.EARLY, 'the iDMA (L2 -> L1) holds 3 transfers, but 4 would be pending')
+            self.c()  # the loads waited in their stage: 2 at once
 
     def test_two_jobs_on_one_accelerator(self):
         c = self.c(('                ev[i].wait()\n', '                ev[i].wait()\n'

@@ -43,12 +43,17 @@ class IdmaCaps:
     # multicast (same arguments as the 1-D unicast). Scopes not listed are
     # lowered by `idma-mcast` to one unicast transfer per destination tile.
     multicast: Dict[str, str] = field(default_factory=dict)
+    # transfers each direction (L2 -> L1, L1 -> out) holds in its hardware job queue, issued and not yet waited:
+    # a pipeline may issue a transfer in an earlier stage than its wait, as an HWPE job, as long as they fit
+    queue_depth: int = 1
 
 
 IDMA = IdmaCaps(max_rank=2, l1_strided=False,
                 functions={1: 'mg_idma_memcpy_1d', 2: 'mg_idma_memcpy_2d'},
                 # one 2D job (source stride 0) per contiguous run of destination tiles, 1-D blocks only
-                multicast={'ROW': 'mg_idma_mcast_row', 'COL': 'mg_idma_mcast_col'})
+                multicast={'ROW': 'mg_idma_mcast_row', 'COL': 'mg_idma_mcast_col'},
+                # iDMA_JobFifoDepth of each channel (magia_tile_pkg.sv)
+                queue_depth=16)
 
 # ----------------------------------------------------------------------------
 # HWPE accelerators (acquire/enqueue -> commit -> start -> event)

@@ -18,7 +18,8 @@ Check (dataflow over the region tree, states none/pending/maybe):
 `maybe` (only on some paths, e.g. under correlated `if`s) is accepted, so
 the check never rejects a correct program; loops are analysed twice, with
 event-array slots rotated across the back edge (a wait on `ev[v - 1]`, issued
-by the previous iteration, is checked in the second walk).
+by the previous iteration, is checked in the second walk); in the time loop of
+a systolic() they are relative to its `pt = t - skew`.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from xdsl.passes import ModulePass
 
 from .. import ir
 from ..errors import MgcError
-from ..expr import Sym, const_of, sub
+from ..expr import Const, Sym, add, const_of, sub
 
 N, P, M = 'none', 'pending', 'maybe'
 
@@ -117,6 +118,13 @@ class _Analysis:
             elif isinstance(op, ir.ForOp):
                 var = op.var.data
                 lo = const_of(op.lo.data) or 0
+                # the time loop of a systolic(): its body starts with `pt = t - skew`, and the event arrays are
+                # indexed by `pt`, which advances with `t`: slots are relative to `pt`, slot 0 is `pt` = 0
+                head = next(iter(op.body.block.ops), None)
+                if isinstance(head, ir.ScalarOp) and var in head.value.data.syms():
+                    v = head.value.data
+                    if const_of(sub(v.subst({var: add(Sym(var), Const(1))}), v)) == 1:
+                        var, lo = head.sym.data, 0
                 entry = {}
                 for k, v in st.items():
                     # constant array slots become relative to the loop variable

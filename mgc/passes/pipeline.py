@@ -28,6 +28,9 @@ Checks:
 * HWPE protocol: per job enqueue -> commit [-> start] -> wait; one simulated
   run checks that the in-order queue commits/starts the intended jobs and
   never holds more than `queue_depth` of them.
+* iDMA queue: a transfer may be issued in an earlier stage than its wait, as
+  a job; the same simulated run checks that each direction never holds more
+  than `devices.IDMA.queue_depth` transfers issued and not yet waited.
 * `sync()` in a `pipeline()` stage needs a trip count that is the same on all
   tiles; `systolic()` stages do not take `sync()`.
 
@@ -305,6 +308,7 @@ class Pipeline(ModulePass):
         issues = self.match_events(uses, var)
         self.split_job_events(issues, var, kdefs)
         self.check_hwpe(uses, issues, blocks, var)
+        self.check_idma(issues, blocks)
         self.cross_stage_events(module, p, issues, var, inferred)
         table = self.depths(module, uses, issues, var, kdefs, inferred, remote=not systolic)
 
@@ -515,6 +519,39 @@ class Pipeline(ModulePass):
                         self.hw_step(o, acc, q, it, j, 3, 'start')
                     if act == 'wait':
                         q[:] = [e for e in q if not (e[0] == it and e[1] is j)]
+
+    @staticmethod
+    def check_idma(issues, blocks):
+        """One simulated run of the schedule, as for the HWPE jobs: a transfer
+        is pending from its issue to its wait, and each direction holds at most
+        `devices.IDMA.queue_depth` pending transfers (its hardware job queue).
+        Transfers under an `if` count as issued; a multicast counts as one."""
+        xfers = {id(it.use.op): it for it in issues if isinstance(it.use.op, ir.IdmaOp)}
+        if not xfers:
+            return
+        waits = {id(w.op): it for it in xfers.values() for w in it.waits}
+        S = 1 + max(b.k for b in blocks)
+        n = 2 * S + 2
+        qd = devices.IDMA.queue_depth
+        pending = {0: [], 1: []}  # dir -> [(iteration, Issue)]
+        for s in range(-1, n + S - 2):
+            for b in blocks:
+                it = s + 1 - b.k
+                if not 0 <= it < n or (s == -1 and b.k != 0):
+                    continue
+                for o in (o for top in b.ops for o in top.walk()):
+                    if id(o) in xfers:
+                        q = pending[o.dir.data]
+                        q.append((it, xfers[id(o)]))
+                        if len(q) > qd:
+                            way = 'L1 -> out' if o.dir.data else 'L2 -> L1'
+                            raise MgcError(o, f'the iDMA ({way}) holds {qd} transfers, but {len(q)} would be pending '
+                                              f'here (iterations {", ".join(str(e[0]) for e in q)}): wait a '
+                                              'transfer earlier')
+                    elif id(o) in waits:
+                        x = waits[id(o)]
+                        d = x.use.op.dir.data
+                        pending[d] = [e for e in pending[d] if not (e[0] == it and e[1] is x)]
 
     @staticmethod
     def hw_step(o, acc, q, it, j, f, what):
