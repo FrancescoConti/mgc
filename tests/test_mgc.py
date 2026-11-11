@@ -1247,7 +1247,7 @@ def main():
 class L1Fit(unittest.TestCase):
     """mgcc --tiles: the L1 buffers of a tile must fit the L1 on the given mesh sides."""
 
-    FA = os.path.join(MESH, 'flat_attn_pipeopt3')
+    FA = _Dir(os.path.join(KERNELS, 'flat_attn_pipeopt3'), os.path.join(MESH, 'flat_attn_pipeopt3'))
 
     def _compile(self, blocks, tiles, l1_bytes=None, kv=None):
         """flat_attn_pipeopt3 with Q and K/V blocks of `blocks` rows (K/V: `kv`, if given): a
@@ -1346,8 +1346,8 @@ class L1Fit(unittest.TestCase):
     def test_mhsa_projection_blocks(self):
         # mhsa_pipeopt3 at S=512, D=3072, P=128, H=8: the projection blocks (PROJ_KB_E/HP) are C
         # expressions over L1_SIZE; with wo pinned to the Flat-Attention loop too, yo lands above it
-        d = os.path.join(MESH, 'mhsa_pipeopt3')
-        hdr = _read(d, os.path.join('include', 'test.h'))
+        d = _Dir(os.path.join(KERNELS, 'mhsa_pipeopt3'), os.path.join(MESH, 'mhsa_pipeopt3'))
+        hdr = _read(d.test, os.path.join('include', 'test.h'))
         for name, v in (('SEQ_LENGTH', 512), ('EMBED_SIZE', 3072), ('PROJ_SIZE', 128), ('NUM_HEADS', 8)):
             hdr, n = re.subn(r'^(#define %s\s+).*$' % name, r'\g<1>(%d)' % v, hdr, flags=re.M)
             self.assertEqual(n, 1)

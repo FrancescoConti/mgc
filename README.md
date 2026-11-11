@@ -600,18 +600,17 @@ Extending:
 
 ## Tests in magia-sdk
 
-All the tests are in `tests/magia/mgc/<dir>`, built as `test_<dir>`, except where noted.
+Each test is a `@kernel` in `kernels/mgc/<kernel>/<kernel>.mgc` (with the generated `src/mgc_<kernel>.c`, `include/mgc_<kernel>.h` and, if it has L1 kernels, their C code in `src/kernels.c`) and its test in `tests/magia/mgc/<dir>` (`include/test.h` and the generated `src/test.c`), built as `test_<dir>`. The kernel is named after the directory, except for the GEMM tests (`mm_os_mgc` calls `mm_os`, ...).
 
 GEMM, compared with the hand-written tests in `tests/magia/mesh`: `mm_os_mglib` and
 `mm_matmul_mglib` on mglib, `mm_ws_2` and `mm_is_2` on the HAL, with the same schedules.
 `*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`.
 
-| Directory | Source | Content |
+| Directory | Kernel sources | Content |
 |---|---|---|
 | `mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 3-stage pipeline: the loads one step ahead of the RedMulE job, queued in the iDMA (`mm_os_explicit.mgc`: the 2-stage schedule, by hand) |
 | `mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
 | `mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
-| `mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
 | `mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
 
 Attention, `O = softmax(Q @ Kt / sqrt(P)) @ V`, with RedMulE for the matrix products and Spatz for
@@ -623,7 +622,7 @@ FlatAttention) or the test's `gen_golden.py`.
 | `unfused_attn` | baseline: three named pipelines in a row (Q @ Kt, row softmax, attn @ V), each through L2, each step's buffers pinned to its loop so that the steps share L1 |
 | `flat_attn_naive` | FlatAttention, one group over the whole mesh, no pipelining |
 | `flat_attn_pipe` | K/V blocks in a software pipeline |
-| `flat_attn_pipeopt` | merged softmax kernels (in the test's `kernels/`), RedMulE jobs enqueued before their Spatz inputs, K/V transfers spread over the step, hot Spatz tasks first in the I$ |
+| `flat_attn_pipeopt` | merged softmax kernels (SDK `kernels/`), RedMulE jobs enqueued before their Spatz inputs, K/V transfers spread over the step, hot Spatz tasks first in the I$ |
 | `flat_attn_pipeopt2` | the Q loop folded into the K/V pipeline |
 | `flat_attn_pipeopt3` | faster softmax on Spatz, tree multicast of Q/Kt/V |
 | `mhsa_pipeopt3` | multi-head self-attention with the Q/Kt/V/output projections, four steps through L2, the attention as `flat_attn_pipeopt3`, projection and attention buffers sharing L1 |
