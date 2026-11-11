@@ -236,13 +236,16 @@ class KernelOp(IRDLOperation):
 
 @irdl_op_definition
 class FuncOp(_Region):
-    """The generated C function: a standalone test (`kind` = 'test', emitted as `main`)
-    or a callable `@top` function (`kind` = 'top'), with its C name, authors,
+    """The generated C function: a standalone test (`kind` = 'test', emitted as `main`),
+    a callable `@top` function (`kind` = 'top') or a `@kernel` with arguments, with its C name, authors,
     docstring and the single `mg.tiles` body."""
     name = 'mg.func'
-    kind = attr_def(StringAttr)  # 'test' | 'top'
+    kind = attr_def(StringAttr)  # 'test' | 'top' | 'kernel'
     fname = attr_def(StringAttr)  # C function name
     test = opt_attr_def(StringAttr)  # test name (kind == 'test')
+    sizes = opt_attr_def(ArrayAttr)  # size macros, the trailing arguments (kind == 'kernel')
+    check = opt_attr_def(ArrayAttr)  # result and golden L2 arrays of the generated test (kind == 'kernel')
+    tol = opt_attr_def(IntAttr)
     authors = attr_def(ArrayAttr)
     doc = opt_attr_def(StringAttr)
     body = region_def()

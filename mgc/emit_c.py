@@ -100,7 +100,8 @@ class Emitter:
         self.kdefs = kernels(module)
         self.w = Writer()
         self.func = next(o for o in module.ops if isinstance(o, ir.FuncOp))
-        self.is_top = self.func.kind.data == 'top'
+        self.kind = self.func.kind.data
+        self.is_top = self.kind in ('top', 'kernel')  # a void function, no test.h
         self.tiles = next(o for o in self.func.body.block.ops if isinstance(o, ir.TilesOp))
         self.evkinds = {o.sym.data: o.kind.data for o in module.walk() if isinstance(o, ir.EventsOp)}
         self.uses_sync = any(isinstance(o, ir.SyncOp) for o in module.walk())
@@ -500,7 +501,19 @@ class Emitter:
             self.w.blank()
             self.w.line('return errors;' if self.check_top is not None else 'return 0;')
         self.w.lines[decl_at:decl_at] = self.declarations()
+        self.drop_unused_last()
         return self.render()
+
+    def drop_unused_last(self):
+        """Remove the `int <var>_last = ...;` of a pipeline whose last iteration nothing uses."""
+        text = '\n'.join(self.w.lines)
+        keep = []
+        for l in self.w.lines:
+            m = re.match(r'\s*int (\w+_last) = ', l)
+            if m and len(re.findall(r'\b%s\b' % m.group(1), text)) == 1:
+                continue
+            keep.append(l)
+        self.w.lines = keep
 
     def render(self):
         """Wrap the printed body in the file header, includes and function signature."""
@@ -519,7 +532,10 @@ class Emitter:
         out += ['', '#include "tile.h"']
         if self.uses_sync:
             out.append('#include "fsync.h"')
-        out += ['#include "mg_idma.h"', '#include "mg_redmule.h"', '#include "mg_event.h"', '']
+        out += ['#include "mg_idma.h"', '#include "mg_redmule.h"', '#include "mg_event.h"']
+        if self.kind == 'kernel':
+            out.append(f'#include "{self.func.fname.data}.h"')
+        out.append('')
         defs = [(o.sym.data, o.text.data) for o in self.m.ops if isinstance(o, ir.DefineOp)]
         if WAIT_MODE not in [n for n, _ in defs]:
             defs.append((WAIT_MODE, 'WFE'))
@@ -540,7 +556,19 @@ class Emitter:
             out.append('/**')
             out += [(' * ' + l).rstrip() for l in inspect.cleandoc(self.func.doc.data).splitlines()]
             out.append(' */')
-        out += [f'void {self.func.fname.data}(void)' if self.is_top else 'int main(void)', '{']
+        if self.kind == 'kernel':
+            fn = self.func.fname.data
+            if self.kdefs:
+                out += [f'{fn}_args_t {fn}_args __attribute__((section(".tile_bss")));', '']
+            args = [f'{ct} *{n}' for ct, n in self.kernel_tensors()] + [f'uint32_t {n}' for n in self.kernel_sizes()]
+            out += [f'void {fn}({", ".join(args)})', '{']
+            if self.kdefs:
+                out.append(f'    /* the arguments, for the L1 kernels */')
+                out += [f'    {fn}_args.{n} = {n};' for _, n in self.kernel_tensors()]
+                out += [f'    {fn}_args.{n.lower()} = {n};' for n in self.kernel_sizes()]
+                out.append('')
+        else:
+            out += [f'void {self.func.fname.data}(void)' if self.is_top else 'int main(void)', '{']
         pro = PROLOGUE_SYNC if self.uses_sync else PROLOGUE
         out += [('    ' + l) if l else '' for l in pro.format(y=self.tiles.y.data, x=self.tiles.x.data).splitlines()]
         body = self.w.lines
@@ -553,6 +581,101 @@ class Emitter:
                 continue
             res.append(l)
         return '\n'.join(res)
+
+    # -- @kernel: header and test ------------------------------------------
+    def kernel_tensors(self):
+        """`(ctype, cname)` of the L2 tensors a @kernel takes, in declaration order (all but the golden one)."""
+        gold = self.func.check.data[1].data if self.func.check is not None else None
+        return [(t.ctype, t.cname) for t in self.ts.values() if t.cname != gold]
+
+    def kernel_sizes(self):
+        """The size macros a @kernel takes, after the tensors."""
+        return [a.data for a in self.func.sizes.data]
+
+    def _license(self, what):
+        authors = [a.data for a in self.func.authors.data]
+        out = ['// Copyright 2026 ETH Zurich, University of Bologna and Fondazione Chips-IT.',
+               '// Licensed under the Apache License, Version 2.0, see LICENSE for details.',
+               '// SPDX-License-Identifier: Apache-2.0',
+               '//']
+        out += [f'// {a}' for a in authors]
+        out += ['//', f'// {what} by mgc from {os.path.basename(self.filename)}: do not edit, re-run mgc/mgcc.py.', '']
+        return out
+
+    def header(self) -> str:
+        """The @kernel header: its prototype and, with L1 kernels, the per-tile copy of its arguments
+        (`<name>_args`) and, under `MGC_GLUE`, macros naming them as in the .mgc."""
+        fn = self.func.fname.data
+        guard = fn.upper() + '_H_'
+        ts, sz = self.kernel_tensors(), self.kernel_sizes()
+        out = self._license('Generated') + [f'#ifndef {guard}', f'#define {guard}', '', '#include <stdint.h>', '']
+        if self.kdefs:
+            out.append('typedef struct {')
+            out += [f'    {ct} *{n};' for ct, n in ts] + [f'    uint32_t {n.lower()};' for n in sz]
+            out += [f'}} {fn}_args_t;', '', '/* The arguments of the running call, in each tile\'s L1. */',
+                    f'extern {fn}_args_t {fn}_args;', '']
+        args = [f'{ct} *{n}' for ct, n in ts] + [f'uint32_t {n.lower()}' for n in sz]
+        out += [f'void {fn}({", ".join(args)});', '']
+        if self.kdefs:
+            out += ['/* For the L1 kernels: the arguments under their names in the .mgc. */', '#ifdef MGC_GLUE']
+            out += [f'#define {n} ({fn}_args.{n})' for _, n in ts] + [f'#define {n} ({fn}_args.{n.lower()})' for n in sz]
+            out += ['#endif', '']
+        out += [f'#endif /* {guard} */', '']
+        return '\n'.join(out)
+
+    def test(self) -> str:
+        """The test of a @kernel: calls it on the L2 data of `test.h`, then each tile compares its share
+        of the rows of the result against the golden data."""
+        fn = self.func.fname.data
+        out = self._license('Test of ' + fn + ', generated')
+        out += ['#include <stdint.h>', '', f'#include "{fn}.h"', '#include "test.h"', '', '#include "tile.h"']
+        if self.func.check is not None:
+            out += ['#include "fsync.h"', '#include "eventunit.h"']
+        out += ['', 'int main(void)', '{', '    uint32_t hartid = get_hartid();', '']
+        w = Writer()
+        w.call(fn, [n for _, n in self.kernel_tensors()] + self.kernel_sizes())
+        if self.func.check is None:
+            w.blank()
+            w.line('return 0;')
+            return '\n'.join(out + w.lines + ['}', ''])
+        res, gold = (a.data for a in self.func.check.data)
+        t = next(x for x in self.ts.values() if x.cname == res)
+        rows, cols = (_paren(e) for e in t.shape)
+        w.blank()
+        w.line('/* once every tile has finished, each tile checks its share of the rows */')
+        w.line('fsync_init();')
+        w.line('eu_fsync_init(0);')
+        w.line('fsync_sync_global();')
+        w.line('eu_fsync_wait(WFE);')
+        w.blank()
+        w.line(f'uint32_t share = ({rows} + NUM_HARTS - 1) / NUM_HARTS;')
+        w.line(f'uint32_t r_end = (hartid + 1) * share < {rows} ? (hartid + 1) * share : {rows};')
+        w.line('uint32_t errors = 0;')
+        ct = t.ctype
+        ra = f'*(volatile {ct} *)({res} + (i * {cols} + j))'
+        rb = f'*(volatile {ct} *)({gold} + (i * {cols} + j))'
+        w.line(f'{ct} computed, expected, diff;')
+        w.line(f'for (uint32_t i = hartid * share; i < r_end; i++) {{')
+        w.line(f'    for (uint32_t j = 0; j < {cols}; j++) {{')
+        w.ind += 2
+        w.line(f'computed = {ra};')
+        w.line(f'expected = {rb};')
+        w.line('diff = (computed > expected) ? (computed - expected) : (expected - computed);')
+        w.line(f'if (diff > 0x{self.func.tol.data:04x}) {{')
+        w.lines.append('#if EVAL == 1')
+        w.ind += 1
+        w.call('printf', [f'"Error detected at coordinates[%d][%d]: {res}=%x {gold}=%x\\n"', 'i', 'j', ra, rb])
+        w.lines.append('#endif')
+        w.line('errors++;')
+        w.ind -= 1
+        w.line('}')
+        w.ind -= 2
+        w.line('    }')
+        w.line('}')
+        w.line('printf("TILE %d: Number of errors: %d\\n", hartid, errors);')
+        w.blank()
+        w.line('return errors;')
+        return '\n'.join(out + w.lines + ['}', ''])
 
 
 PROLOGUE = '''/**
@@ -600,3 +723,11 @@ def emit(module, filename) -> str:
     `filename` is the `.mgc` path, mentioned in the "Generated by mgc" header.
     """
     return Emitter(module, filename).emit()
+
+
+def emit_kernel(module, filename):
+    """A @kernel: `(kernel C, kernel header, test C)` texts (before clang-format)."""
+    e = Emitter(module, filename)
+    if e.kind != 'kernel':
+        raise MgcError(None, 'not a @kernel program')
+    return e.emit(), e.header(), e.test()

@@ -312,6 +312,8 @@ class Frontend:
         }
         self.module_ops = []
         self.blocks: List[Block] = []
+        self.kind = None
+        self.size_names: List[str] = []
 
     # -- building ------------------------------------------------------------
     def add(self, op, node=None):
@@ -347,22 +349,21 @@ class Frontend:
         Result: `[mg.tensor/mg.define/mg.kernel ..., mg.func{ mg.tiles{ ... } }]`.
         Raises `MgcError` (with the source line) on anything unsupported.
         """
-        main = None
+        fns = [s for s in self.tree.body if isinstance(s, ast.FunctionDef)]
+        if len(fns) > 1:
+            raise MgcError(fns[1], 'an mgc program defines exactly one function (@test `main`, @top or @kernel)')
+        if not fns:
+            raise MgcError(None, 'no @test `main`, @top or @kernel function')
+        main = fns[0]
+        kind, name, authors, kcheck = self.decorator(main)
+        self.kind = kind
         for s in self.tree.body:
-            if isinstance(s, (ast.Import, ast.ImportFrom)) or _is_doc(s):
-                continue
-            if isinstance(s, ast.FunctionDef):
-                if main is not None:
-                    raise MgcError(s, 'an mgc program defines exactly one function (@test `main` or @top)')
-                main = s
+            if isinstance(s, (ast.Import, ast.ImportFrom, ast.FunctionDef)) or _is_doc(s):
                 continue
             if isinstance(s, ast.Assign):
                 self.module_assign(s)
                 continue
             raise MgcError(s, 'unsupported statement at module level')
-        if main is None:
-            raise MgcError(None, 'no @test `main` or @top function')
-        kind, name, authors = self.decorator(main)
         body = list(main.body)
         doc = body.pop(0).value.value if body and _is_doc(body[0]) else None
         if len(body) != 1 or not isinstance(body[0], ast.For) or _call_parts(body[0].iter)[1] != 'tiles':
@@ -380,10 +381,22 @@ class Frontend:
         tiles = ir.TilesOp.create(attributes={'y': StringAttr(yv), 'x': StringAttr(xv)},
                                   regions=[self.region(tl.body, top=True)])
         self.blocks.pop()
-        attrs = {'kind': StringAttr(kind), 'fname': StringAttr(main.name if kind == 'top' else 'main'),
-                 'authors': ir.strs(authors)}
+        fname = {'test': 'main', 'top': main.name, 'kernel': name}[kind]
+        attrs = {'kind': StringAttr(kind), 'fname': StringAttr(fname), 'authors': ir.strs(authors)}
         if kind == 'test':
             attrs['test'] = StringAttr(name)
+        if kind == 'kernel':
+            attrs['sizes'] = ir.strs(self.size_names)
+            if kcheck is not None:
+                res, gold, tol = kcheck
+                for t in (res, gold):
+                    if not isinstance(self.env.get(t), Tensor):
+                        raise MgcError(main, f'@kernel check: {t} is not an l2() tensor')
+                tr, tg = self.env[res], self.env[gold]
+                if tr.dtype != tg.dtype or len(tr.shape) != 2:
+                    raise MgcError(main, '@kernel check: two 2-D l2() tensors of the same dtype')
+                attrs['check'] = ir.strs([tr.cname, tg.cname])
+                attrs['tol'] = IntAttr(tol)
         if doc:
             attrs['doc'] = StringAttr(doc)
         func = ir.FuncOp.create(attributes=attrs, regions=[Region(Block([tiles]))])
@@ -391,30 +404,46 @@ class Frontend:
 
     @staticmethod
     def decorator(fn):
-        """Classify the single function: returns `(kind, test_name, authors)`.
+        """Classify the single function: returns `(kind, name, authors, check)`.
 
         `@test("name", authors=[...])` on `main` -> kind `'test'`;
         `@top` / `@top(authors=[...])` on any name -> kind `'top'` (a callable function,
-        no `main`, no test header).
+        no `main`, no test header);
+        `@kernel("c_name", check=(Y, Z), tol=0x11, authors=[...])` -> kind `'kernel'`: a
+        callable function taking the L2 tensors and the sizes as arguments, plus a test
+        calling it and comparing `Y` against the golden `Z`. `check` is `(Y, Z, tol)` or None.
         """
         if len(fn.decorator_list) != 1:
-            raise MgcError(fn, 'the function must have exactly one decorator: @test(...) on `main`, or @top')
+            raise MgcError(fn, 'the function must have exactly one decorator: @test(...) on `main`, @top or @kernel(...)')
         d = fn.decorator_list[0]
         dfn = _name(d) or _call_parts(d)[1]
         args, kws = (d.args, d.keywords) if isinstance(d, ast.Call) else ([], [])
-        authors = []
+        authors, check, tol = [], None, 0
         for kw in kws:
             if kw.arg == 'authors':
                 authors = ast.literal_eval(kw.value)
+            elif kw.arg == 'check' and dfn == 'kernel':
+                if not (isinstance(kw.value, ast.Tuple) and len(kw.value.elts) == 2
+                        and all(isinstance(e, ast.Name) for e in kw.value.elts)):
+                    raise MgcError(d, '@kernel(check=(result, golden)): two l2() tensor names')
+                check = tuple(e.id for e in kw.value.elts)
+            elif kw.arg == 'tol' and dfn == 'kernel':
+                tol = ast.literal_eval(kw.value)
+            else:
+                raise MgcError(d, f'unknown decorator argument {kw.arg}')
         if dfn == 'test':
             if fn.name != 'main':
                 raise MgcError(fn, 'a @test function must be named `main` (use @top for a callable function)')
-            return 'test', (ast.literal_eval(args[0]) if args else 'test'), authors
+            return 'test', (ast.literal_eval(args[0]) if args else 'test'), authors, None
         if dfn == 'top':
             if args:
                 raise MgcError(d, '@top takes no positional arguments (only `authors=[...]`)')
-            return 'top', None, authors
-        raise MgcError(d, 'the function must be decorated with @test(...) or @top')
+            return 'top', None, authors, None
+        if dfn == 'kernel':
+            if len(args) != 1:
+                raise MgcError(d, '@kernel("c_name", check=(result, golden), tol=..., authors=[...])')
+            return 'kernel', ast.literal_eval(args[0]), authors, (check + (tol,) if check else None)
+        raise MgcError(d, 'the function must be decorated with @test(...), @top or @kernel(...)')
 
     def module_assign(self, s):
         """Handle one module-level assignment. Supported forms:
@@ -433,7 +462,9 @@ class Frontend:
             for t, n in zip(tgt.elts, names):
                 if self.header and n not in self.hdefs:
                     raise MgcError(s, f'{n} is not #defined in {self.header}')
-                self.env[t.id] = Sym(n, self.hdefs.get(n))
+                # in a @kernel the sizes are run-time arguments: never folded
+                self.env[t.id] = Sym(n, None if self.kind == 'kernel' else self.hdefs.get(n))
+                self.size_names.append(n)
         elif fn == 'l2':
             cname = ast.literal_eval(s.value.args[0])
             shape = [self.expr(e) for e in s.value.args[1].elts]
@@ -1126,6 +1157,8 @@ class Frontend:
         """`check(Y[:, tw], Z[:, tw], tol=0x11)`: compare a computed 2-D L2 region
         against golden data, element by element, with absolute tolerance `tol`
         (default 0). The generated test returns the number of mismatches."""
+        if self.kind == 'kernel':
+            raise MgcError(c, 'a @kernel has no check(): use @kernel(check=(result, golden), tol=...)')
         if len(c.args) != 2:
             raise MgcError(c, 'check(result_view, golden_view, tol=...)')
         a, b = self.ev(c.args[0]), self.ev(c.args[1])

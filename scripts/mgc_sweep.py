@@ -31,7 +31,7 @@ The golden data of all the configurations are generated first, J at a time, into
 
 Parameters (S, D, P, H, HKV, I, M, N, K, IMG_H, IMG_W, CIN, COUT, KS, STRIDE from include/test.h,
 S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
-default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
+default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and the kernel and src/test.c (mgcc) in
 the job slot's mirror of the SDK. D and H are written to test.h but not used by the current attention kernels.
 The blocking of a test (H_NB blocks of heads, PRJ_NB blocks of rows of the projections and the attention blocks
 S_BLOCK_SIZE_Q/KV of the attention tests, M_NB blocks of output rows of the mm tests), when not given, is instead
@@ -221,9 +221,14 @@ class Test:
         self.gen = os.path.join(self.dir, 'gen_golden.py')
         # its golden generator sizes the blocks over L1 (the tile address map's L1_SIZE)
         self.l1_golden = os.path.exists(self.gen) and 'l1_bytes()' in read(self.gen)
-        self.mgc = os.path.join(self.dir, name + '.mgc')
-        if not os.path.exists(self.mgc):
-            self.mgc = sorted(glob.glob(os.path.join(self.dir, '*.mgc')))[0]
+        # the kernel the test calls (set(MGC_KERNEL k) in its CMakeLists.txt): kernels/mgc/k/k.mgc, generated into
+        # src/mgc_k.c and include/mgc_k.h there
+        m = re.search(r'set\(MGC_KERNEL\s+(\S+)\)', cmake)
+        k = m.group(1) if m else name
+        self.kdir = os.path.join(REPO, 'kernels', 'mgc', k)
+        self.mgc = os.path.join(self.kdir, k + '.mgc')
+        self.kernel_c = os.path.join(self.kdir, 'src', 'mgc_%s.c' % k)
+        self.kernel_h = os.path.join(self.kdir, 'include', 'mgc_%s.h' % k)
         if name.startswith('flat_attn'):
             self.kind = 'flat_attn'
         elif name.startswith('mhsa'):
@@ -244,7 +249,7 @@ class Test:
     def at(self, root):
         """This test with its source paths under `root`, a mirror of the SDK (see mirror_sdk())."""
         t = copy.copy(self)
-        for a in ('dir', 'header', 'test_c', 'gen', 'mgc'):
+        for a in ('dir', 'header', 'test_c', 'gen', 'kdir', 'mgc', 'kernel_c', 'kernel_h'):
             setattr(t, a, os.path.join(root, os.path.relpath(getattr(self, a), REPO)))
         return t
 
@@ -489,9 +494,9 @@ def pregenerate(runs, args, log):
 
 
 def pristine(test, orig):
-    """Copy the committed test.h, test.c and .mgc of `orig` (the test in the SDK) over those of `test` (the
-    same test in a slot's mirror), which an earlier configuration of the slot may have changed."""
-    for a in ('header', 'test_c', 'mgc'):
+    """Copy the committed test.h, test.c, .mgc and kernel of `orig` (the test in the SDK) over those of `test`
+    (the same test in a slot's mirror), which an earlier configuration of the slot may have changed."""
+    for a in ('header', 'test_c', 'mgc', 'kernel_c', 'kernel_h'):
         shutil.copy2(getattr(orig, a), getattr(test, a))
 
 
@@ -510,7 +515,7 @@ def generate(test, cfg, tiles, args, log, l1=None):
         if cfg[p] is not None:
             src = re.sub(r'^(%s\s*=\s*define\()\d+(\))' % p, r'\g<1>%d\2' % cfg[p], src, flags=re.M)
     write(test.mgc, src)
-    return mgcc(test, tiles, args, test.test_c, log, l1)
+    return mgcc(test, tiles, args, log, l1)
 
 
 def regen_golden(test, cfg, tiles, l1):
@@ -519,11 +524,12 @@ def regen_golden(test, cfg, tiles, l1):
     return test.needs_regen(cfg, tiles) or bool(l1 and test.l1_golden)
 
 
-def mgcc(test, tiles, args, out, log, l1=None):
-    """Compile the test's .mgc to `out`, checking that its L1 buffers fit on a `tiles` x `tiles`
+def mgcc(test, tiles, args, log, l1=None):
+    """Compile the test's .mgc to its kernel and test.c, checking that its L1 buffers fit on a `tiles` x `tiles`
     mesh (its warnings, e.g. buffers it could not size, go to `log`), with the L1 `l1` (see l1_kib());
     the reason it failed, or None."""
-    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '--header', test.header, '-o', out,
+    r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), test.mgc, '--header', test.header,
+                        '-o', test.kernel_c, '--kernel-header', test.kernel_h, '--test', test.test_c,
                         '--tiles', str(tiles)], cwd=REPO, env=dict(os.environ, MAGIA_SDK=l1_sdk(args, l1)),
                        capture_output=True, text=True)
     if r.returncode:
@@ -583,7 +589,7 @@ def fits_l1(t, cfg, tiles, args, l1, tmp):
     write(os.path.join(tmp, 'test.h'), hdr)
     write(mgc, src)
     r = subprocess.run([args.mgcc_python, os.path.join(MGC, 'mgcc.py'), mgc, '--header', os.path.join(tmp, 'test.h'),
-                        '-o', os.devnull, '--no-format', '--tiles', str(tiles)],
+                        '-o', os.devnull, '--kernel-header', os.devnull, '--no-format', '--tiles', str(tiles)],
                        cwd=REPO, env=dict(os.environ, MAGIA_SDK=l1_sdk(args, l1)), capture_output=True, text=True)
     return ' '.join(r.stderr.replace(mgc, os.path.basename(t.mgc)).split())[:200] if r.returncode else None
 
@@ -715,7 +721,7 @@ def mirror_sdk(root, tests):
     the folders of `tests` and MIRROR_COPIES are copied, the folders on the way to them recreated, and every
     other entry is a symbolic link to the SDK's. The CMake files reach the shared sources (kernels, mglib,
     targets) through relative paths, which resolve through the links."""
-    copies = MIRROR_COPIES + [os.path.relpath(t.dir, REPO) for t in tests]
+    copies = MIRROR_COPIES + [os.path.relpath(d, REPO) for t in tests for d in (t.dir, t.kdir)]
 
     def visit(rel):
         os.makedirs(os.path.join(root, rel), exist_ok=True)

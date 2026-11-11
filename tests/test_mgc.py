@@ -23,11 +23,27 @@ sys.path.insert(0, MGC)
 
 from mgc import cexpr, devices  # noqa: E402
 from mgc.driver import compile_module, compile_source, print_ir  # noqa: E402
+from mgc.emit_c import Emitter  # noqa: E402
 from mgc.errors import MgcError, MgcWarning  # noqa: E402
 
 MESH = os.path.join(REPO, 'tests', 'magia', 'mgc')
-OS, WS, IS, L1K = (os.path.join(MESH, d) for d in ('mm_os_mgc', 'mm_ws_mgc', 'mm_is_mgc', 'mm_os_l1k'))
-MM = os.path.join(MESH, 'mm_matmul_mgc')
+KERNELS = os.path.join(REPO, 'kernels', 'mgc')
+DATA = os.path.join(MGC, 'tests', 'data')
+
+
+class _Dir(str):
+    """Where a program's .mgc is (an SDK kernel folder, or a fixture), with `test` the folder of its test
+    (include/test.h, src/test.c)."""
+
+    def __new__(cls, path, test):
+        d = super().__new__(cls, path)
+        d.test = test
+        return d
+
+
+OS, WS, IS, MM = (_Dir(os.path.join(KERNELS, k), os.path.join(MESH, t)) for k, t in
+                  (('mm_os', 'mm_os_mgc'), ('mm_ws', 'mm_ws_mgc'), ('mm_is', 'mm_is_mgc'), ('mm_matmul', 'mm_matmul_mgc')))
+L1K = _Dir(os.path.join(DATA, 'mm_os_l1k'), os.path.join(DATA, 'mm_os_l1k'))
 
 
 def _read(d, name):
@@ -36,7 +52,7 @@ def _read(d, name):
 
 
 def _hdr(d):
-    return os.path.join(d, 'include', 'test.h')
+    return os.path.join(getattr(d, 'test', d), 'include', 'test.h')
 
 
 def _c(d, name, src=None):
@@ -65,11 +81,22 @@ class Golden(unittest.TestCase):
     """The committed tests are exactly what mgcc produces from their sources."""
 
     def check(self, d, name):
+        """The kernel C, its header and its test (a @kernel in the SDK), or the test C (a fixture)."""
         if _clang_format() is None:
             self.skipTest('clang-format not available')
-        out = subprocess.run([sys.executable, os.path.join(MGC, 'mgcc.py'), os.path.join(d, name)],
-                             capture_output=True, text=True, check=True).stdout
-        self.assertEqual(out, _read(d, os.path.join('src', 'test.c')))
+        k = name[:-len('.mgc')]
+        with tempfile.TemporaryDirectory() as tmp:
+            outs = {'c': os.path.join(tmp, 'src', 'k.c'), 'h': os.path.join(tmp, 'k.h'), 't': os.path.join(tmp, 't.c')}
+            subprocess.run([sys.executable, os.path.join(MGC, 'mgcc.py'), os.path.join(d, name), '--header', _hdr(d),
+                            '-o', outs['c'], '--kernel-header', outs['h'], '--test', outs['t']],
+                           capture_output=True, text=True, check=True)
+            got = {x: _read(tmp, p) for x, p in outs.items() if os.path.exists(p)}
+        if d.test.startswith(DATA):
+            self.assertEqual(got['c'], _read(d.test, 'test.c'))
+            return
+        self.assertEqual(got['c'], _read(d, os.path.join('src', f'mgc_{k}.c')))
+        self.assertEqual(got['h'], _read(d, os.path.join('include', f'mgc_{k}.h')))
+        self.assertEqual(got['t'], _read(d.test, os.path.join('src', 'test.c')))
 
     def test_mm_os(self):
         self.check(OS, 'mm_os.mgc')
@@ -386,7 +413,7 @@ def main():
         c = _c(MM, 'x.mgc', self.ONESHOT.replace('        redmule.gemm(', '        idma.load(y, Y[tile_h, tile_w]).wait()\n'
                                                                        '        redmule.gemm('))
         self.assertIn('mg_redmule_gemm(WAIT_MODE,', c)
-        self.assertNotIn('matmul', c)
+        self.assertNotIn('mg_redmule_matmul', c)
 
     def test_uninit_pipeline(self):
         # iteration 0 (pipeline prologue) is a MATMUL, the step loop accumulates
@@ -402,7 +429,7 @@ def main():
         self.assertEqual(c.count('mg_redmule_matmul_enqueue('), 1)
 
     def test_loaded_accumulator(self):
-        self.assertNotIn('matmul', _c(OS, 'mm_os.mgc'))
+        self.assertNotIn('mg_redmule_matmul', _c(OS, 'mm_os.mgc'))
 
     def test_write_before_wait(self):
         # zeroing y after the enqueue but before the commit initializes it: the
@@ -411,12 +438,12 @@ def main():
                      'WAIT_MODE = define(WFE)\nzero = l1_kernel("zero_fp16", operands=("y:out",), '
                      'params=("y.size",), executor=CORE)\n'),
                     ('                ex.wait()\n', '                zero(y)\n                ex.wait()\n'))
-        self.assertNotIn('matmul', c)
+        self.assertNotIn('mg_redmule_matmul', c)
 
     def test_remote_write(self):
         # partial sums written by the tile above: never switched
-        self.assertNotIn('matmul', _c(WS, 'mm_ws.mgc'))
-        self.assertNotIn('matmul', _c(IS, 'mm_is.mgc'))
+        self.assertNotIn('mg_redmule_matmul', _c(WS, 'mm_ws.mgc'))
+        self.assertNotIn('mg_redmule_matmul', _c(IS, 'mm_is.mgc'))
 
 
 class PartialStore(unittest.TestCase):
@@ -626,14 +653,14 @@ def main():
 class TopFunction(unittest.TestCase):
     """`@top` emits a callable void function instead of a test `main`."""
 
-    TEST_DECO = '@test("test_mm_os_mgc", authors=["Francesco Conti <f.conti@unibo.it>"])\ndef main():'
+    KERNEL_DECO = '@kernel("mgc_mm_os", check=(Y, Z), tol=0x11, authors=["Francesco Conti <f.conti@unibo.it>"])\ndef mm_os():'
+    CHECK = '\n        check(Y[:, :], Z[:, :], tol=0x11)\n'
 
     def top(self, deco='@top', fname='my_gemm', drop_check=True):
-        src = _read(OS, 'mm_os.mgc').replace(self.TEST_DECO, f'{deco}\ndef {fname}():')
-        if drop_check:  # the check and the two ifs it is in
-            src = src.replace('        if y_id == 0:\n            if x_id == 0:\n'
-                              '                check(Y[:, :], Z[:, :], tol=0x11)\n', '')
-        return src
+        src = _read(OS, 'mm_os.mgc')
+        assert self.KERNEL_DECO in src
+        src = src.replace(self.KERNEL_DECO, f'{deco}\ndef {fname}():')
+        return src if drop_check else src.rstrip('\n') + self.CHECK
 
     def test_top_emits_function(self):
         c = _c(OS, 'mm_os.mgc', self.top())
@@ -655,6 +682,21 @@ class TopFunction(unittest.TestCase):
     def test_test_must_be_main(self):
         with self.assertRaisesRegex(MgcError, 'named `main`'):
             _c(OS, 'mm_os.mgc', self.top('@test("x")'))
+
+    def test_kernel_rejects_check(self):
+        src = _read(OS, 'mm_os.mgc').rstrip('\n') + self.CHECK
+        with self.assertRaisesRegex(MgcError, 'has no check'):
+            _c(OS, 'mm_os.mgc', src)
+
+    def test_kernel_signature_and_test(self):
+        e = Emitter(compile_module(_read(OS, 'mm_os.mgc'), 'mm_os.mgc', _hdr(OS)), 'mm_os.mgc')
+        c, h, t = e.emit(), e.header(), e.test()
+        self.assertIn('void mgc_mm_os(uint16_t *x_inp, uint16_t *w_inp, uint16_t *y_inp, uint32_t M_SIZE, '
+                      'uint32_t N_SIZE, uint32_t K_SIZE)', c)
+        self.assertNotIn('z_out', c + h)  # the golden data is the test's
+        self.assertIn('uint32_t m_size', h)
+        self.assertIn('mgc_mm_os(x_inp, w_inp, y_inp, M_SIZE, N_SIZE, K_SIZE);', t)
+        self.assertIn('z_out', t)
 
     def test_undecorated_rejected(self):
         with self.assertRaisesRegex(MgcError, 'exactly one decorator'):

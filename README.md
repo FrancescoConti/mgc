@@ -29,8 +29,11 @@ mgc/.venv/bin/pip install -r mgc/requirements.txt
 
 ```sh
 # compile (the header defaults to include/test.h next to the source)
-mgc/.venv/bin/python mgc/mgcc.py tests/magia/mgc/mm_os_mgc/mm_os.mgc \
-    -o tests/magia/mgc/mm_os_mgc/src/test.c
+mgc/.venv/bin/python mgc/mgcc.py prog.mgc -o src/test.c
+
+# a @kernel: the kernel, its header and its test
+mgc/.venv/bin/python mgc/mgcc.py kernels/mgc/mm_os/mm_os.mgc --header tests/magia/mgc/mm_os_mgc/include/test.h \
+    -o kernels/mgc/mm_os/src/mgc_mm_os.c --test tests/magia/mgc/mm_os_mgc/src/test.c
 
 # build and run as any other test
 make build tiles=2 test=test_mm_os_mgc
@@ -47,6 +50,8 @@ mgc/.venv/bin/python -m unittest discover -s mgc/tests
 | `--print-ir-after=STAGE` | print the IR after `frontend` or a pass, then stop |
 | `--print-ir-after-all` | print the IR after every stage to stderr |
 | `--no-format` | skip clang-format (otherwise taken from `PATH` or `llvm/install/bin`) |
+| `--kernel-header FILE` | `@kernel`: the header (default: `include/<name>.h` next to the `src/` of `-o`) |
+| `--test FILE` | `@kernel`: the test calling the kernel |
 
 Generated files are committed next to their source. Regenerate them after editing a `.mgc` file
 or the compiler; the unit tests fail if they are out of date.
@@ -116,6 +121,7 @@ resolve in editors and linters; mgcc never executes the file.
 | `k = l1_kernel("c_fn", operands=("dst:out", "src:in"), params=("src.size",), executor=CORE)` | Declares a software kernel: a C function `c_fn`, written by you in the test (e.g. `src/kernels.c`), that runs on the tile's core and works on data in L1. `operands` lists the L1 buffers it takes, each with a role (`in`, `out`, `inout`) that the compiler uses to order operations. `params` are extra integer arguments computed from operand shapes (`src.size`, `src.bytes`, `src.shape[i]`). `args=("row", ...)` names integer arguments given at each call after the operands, as expressions of the scalars in scope (`k(dst, src, i // 4)`); in a `pipeline()` stage they take the stage's iteration, like the other expressions. `executor` says who runs it (`CORE` is the only one at present). Calling `k(...)` in `main` invokes the function. |
 | `@test("name", authors=[...])` + `def main():` | Marks `main` as the test being compiled: `name` is the test name and `authors` are listed in the generated file header. The docstring of `main` becomes the descriptive comment at the top of the generated C. `main` is the only function allowed in the file. |
 | `@top` / `@top(authors=[...])` + `def name():` | Alternative to `@test`, for code meant to be called from a larger program: the generated C is a `void name(void)` function (named after the Python function) with no `main`, no `#include "test.h"` and no `return` value. It still initialises the idma/redmule/eu/fsync controllers itself, so it is a drop-in call. `check()` is not available (nothing to return), and a file holds either one `@test` `main` or one `@top` function. The `--header` is optional. |
+| `@kernel("mgc_name", check=(Y, Z), tol=0x11, authors=[...])` + `def name():` | A kernel and its test, as in magia-sdk's `kernels/mgc/<name>/`: `-o` gets `void mgc_name(...)`, which takes the `l2()` tensors (all but the golden `Z`) and then the `sizes()` as `uint32_t` arguments, so a size is never folded at compile time; `--kernel-header` (default `include/mgc_name.h` next to the `src/` of `-o`) its prototype; `--test` a `main` that calls it on the arrays of the header and, after a global barrier, has each tile compare its share of the rows of `Y` with `Z` (absolute tolerance `tol`). `check()` is not allowed in the body. With `l1_kernel`s, the arguments are also copied into `mgc_name_args`, in each tile's L1, and the header defines them under their .mgc names for a C file that defines `MGC_GLUE` before including it. |
 
 ### Loops
 
@@ -276,7 +282,7 @@ the number of stages. With `n = 4` and `S = 3` (load → gemm → store):
 A stage may have several blocks. Since blocks run in textual order, a second `stage(0)` block
 at the end of the body runs at the end of every step: issuing the loads of stage 0 first and
 waiting them last lets them overlap the work of the later stages in between (see
-`tests/magia/mgc/mm_os_l1k` and the weight-static example in [`systolic`](#systolicn-skew-syncscope-timet)).
+`tests/data/mm_os_l1k` and the weight-static example in [`systolic`](#systolicn-skew-syncscope-timet)).
 
 #### After the loop: `LAST`
 
@@ -483,7 +489,7 @@ A tile is idle (only taking part in the barriers) for the first `skew` time step
 `n + S - 2` loop steps are done. The prologue is not delayed by `skew`: it runs on every tile
 before the time loop.
 
-Weight-static GEMM (`tests/magia/mgc/mm_ws_mgc/mm_ws.mgc`), complete per-tile code:
+Weight-static GEMM (`kernels/mgc/mm_ws/mm_ws.mgc`), complete per-tile code:
 
 ```python
 for y_id, x_id in tiles():
@@ -519,10 +525,6 @@ for y_id, x_id in tiles():
                 es.wait()
             with stage(1):
                 j.wait()
-
-    sync(COL)
-    if y_id == MESH_Y_TILES - 1:
-        check(Y[:, tile_w], Z[:, tile_w], tol=0x11)
 ```
 
 ### Comments
