@@ -221,11 +221,11 @@ class Test:
         self.gen = os.path.join(self.dir, 'gen_golden.py')
         # its golden generator sizes the blocks over L1 (the tile address map's L1_SIZE)
         self.l1_golden = os.path.exists(self.gen) and 'l1_bytes()' in read(self.gen)
-        # the kernel the test calls (set(MGC_KERNEL k) in its CMakeLists.txt): kernels/mgc/k/k.mgc, generated into
+        # the kernel the test calls (set(MGC_KERNEL k) in its CMakeLists.txt): kernels/mgc_kernels/k/k.mgc, generated into
         # src/mgc_k.c and include/mgc_k.h there
         m = re.search(r'set\(MGC_KERNEL\s+(\S+)\)', cmake)
         k = m.group(1) if m else name
-        self.kdir = os.path.join(REPO, 'kernels', 'mgc', k)
+        self.kdir = os.path.join(REPO, 'kernels', 'mgc_kernels', k)
         self.mgc = os.path.join(self.kdir, k + '.mgc')
         self.kernel_c = os.path.join(self.kdir, 'src', 'mgc_%s.c' % k)
         self.kernel_h = os.path.join(self.kdir, 'include', 'mgc_%s.h' % k)

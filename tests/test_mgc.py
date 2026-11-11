@@ -27,7 +27,7 @@ from mgc.emit_c import Emitter  # noqa: E402
 from mgc.errors import MgcError, MgcWarning  # noqa: E402
 
 MESH = os.path.join(REPO, 'tests', 'magia', 'mgc')
-KERNELS = os.path.join(REPO, 'kernels', 'mgc')
+KERNELS = os.path.join(REPO, 'kernels', 'mgc_kernels')
 DATA = os.path.join(MGC, 'tests', 'data')
 
 
