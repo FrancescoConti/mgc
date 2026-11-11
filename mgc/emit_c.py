@@ -560,7 +560,7 @@ class Emitter:
             fn = self.func.fname.data
             if self.kdefs:
                 out += [f'{fn}_args_t {fn}_args __attribute__((section(".tile_bss")));', '']
-            args = [f'{ct} *{n}' for ct, n in self.kernel_tensors()] + [f'uint32_t {n}' for n in self.kernel_sizes()]
+            args = [f'{ct} *{n}' for ct, n in self.kernel_tensors()] + [f'int32_t {n}' for n in self.kernel_sizes()]
             out += [f'void {fn}({", ".join(args)})', '{']
             if self.kdefs:
                 out.append(f'    /* the arguments, for the L1 kernels */')
@@ -611,10 +611,10 @@ class Emitter:
         out = self._license('Generated') + [f'#ifndef {guard}', f'#define {guard}', '', '#include <stdint.h>', '']
         if self.kdefs:
             out.append('typedef struct {')
-            out += [f'    {ct} *{n};' for ct, n in ts] + [f'    uint32_t {n.lower()};' for n in sz]
+            out += [f'    {ct} *{n};' for ct, n in ts] + [f'    int32_t {n.lower()};' for n in sz]
             out += [f'}} {fn}_args_t;', '', '/* The arguments of the running call, in each tile\'s L1. */',
                     f'extern {fn}_args_t {fn}_args;', '']
-        args = [f'{ct} *{n}' for ct, n in ts] + [f'uint32_t {n.lower()}' for n in sz]
+        args = [f'{ct} *{n}' for ct, n in ts] + [f'int32_t {n.lower()}' for n in sz]
         out += [f'void {fn}({", ".join(args)});', '']
         if self.kdefs:
             out += ['/* For the L1 kernels: the arguments under their names in the .mgc. */', '#ifdef MGC_GLUE']

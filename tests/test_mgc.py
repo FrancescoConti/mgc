@@ -691,10 +691,10 @@ class TopFunction(unittest.TestCase):
     def test_kernel_signature_and_test(self):
         e = Emitter(compile_module(_read(OS, 'mm_os.mgc'), 'mm_os.mgc', _hdr(OS)), 'mm_os.mgc')
         c, h, t = e.emit(), e.header(), e.test()
-        self.assertIn('void mgc_mm_os(uint16_t *x_inp, uint16_t *w_inp, uint16_t *y_inp, uint32_t M_SIZE, '
-                      'uint32_t N_SIZE, uint32_t K_SIZE)', c)
+        self.assertIn('void mgc_mm_os(uint16_t *x_inp, uint16_t *w_inp, uint16_t *y_inp, int32_t M_SIZE, '
+                      'int32_t N_SIZE, int32_t K_SIZE)', c)
         self.assertNotIn('z_out', c + h)  # the golden data is the test's
-        self.assertIn('uint32_t m_size', h)
+        self.assertIn('int32_t m_size', h)
         self.assertIn('mgc_mm_os(x_inp, w_inp, y_inp, M_SIZE, N_SIZE, K_SIZE);', t)
         self.assertIn('z_out', t)
 
