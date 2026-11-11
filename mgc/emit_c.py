@@ -105,6 +105,7 @@ class Emitter:
         self.tiles = next(o for o in self.func.body.block.ops if isinstance(o, ir.TilesOp))
         self.evkinds = {o.sym.data: o.kind.data for o in module.walk() if isinstance(o, ir.EventsOp)}
         self.uses_sync = any(isinstance(o, ir.SyncOp) for o in module.walk())
+        self.uses_spatz = any(k.executor.data == 'SPATZ' for k in self.kdefs.values())
         checks = [o for o in module.walk() if isinstance(o, ir.CheckOp)]
         if len(checks) > 1:
             raise MgcError(checks[1], 'only one check() per test')
@@ -175,8 +176,7 @@ class Emitter:
         elif isinstance(op, ir.WaitOp):
             self.wait(op)
         elif isinstance(op, ir.SyncOp):
-            w.line(f'{devices.SYNC[op.scope.data]}();')
-            w.line(f'eu_fsync_wait({WAIT_MODE});')
+            w.line(f'{devices.SYNC[op.scope.data]}({WAIT_MODE});')
         elif isinstance(op, ir.SelectOp):
             self.select(op)
         elif isinstance(op, ir.CheckOp):
@@ -522,7 +522,9 @@ class Emitter:
             out.append('#include "test.h"')
         out += ['', '#include "tile.h"']
         if self.uses_sync:
-            out.append('#include "fsync.h"')
+            out.append('#include "mg_fsync.h"')
+        if self.uses_spatz:
+            out.append('#include "mg_spatz.h"')
         out += ['#include "mg_idma.h"', '#include "mg_redmule.h"', '#include "mg_event.h"']
         if self.kind == 'kernel':
             out.append(f'#include "{self.func.fname.data}.h"')
@@ -560,8 +562,12 @@ class Emitter:
                 out.append('')
         else:
             out += [f'void {self.func.fname.data}(void)' if self.is_top else 'int main(void)', '{']
-        pro = PROLOGUE_SYNC if self.uses_sync else PROLOGUE
-        out += [('    ' + l) if l else '' for l in pro.format(y=self.tiles.y.data, x=self.tiles.x.data).splitlines()]
+        pro = (PROLOGUE_SYNC if self.uses_sync else PROLOGUE).format(y=self.tiles.y.data, x=self.tiles.x.data)
+        if self.uses_spatz:
+            pro = pro.replace('\n\nuint32_t ' + self.tiles.y.data, '\nmg_spatz_init();\n\nuint32_t ' + self.tiles.y.data, 1)
+            pro = pro.replace('redmule and fsync', 'redmule, fsync and Spatz').replace('idma and redmule.',
+                                                                                    'idma, redmule and Spatz.')
+        out += [('    ' + l) if l else '' for l in pro.splitlines()]
         body = self.w.lines
         while body and body[0] == '':
             body.pop(0)
@@ -621,7 +627,7 @@ class Emitter:
         out = self._license('Test of ' + fn + ', generated')
         out += ['#include <stdint.h>', '', f'#include "{fn}.h"', '#include "test.h"', '', '#include "tile.h"']
         if self.func.check is not None:
-            out += ['#include "fsync.h"', '#include "eventunit.h"']
+            out.append('#include "mg_fsync.h"')
         out += ['', 'int main(void)', '{', '    uint32_t hartid = get_hartid();', '']
         w = Writer()
         w.call(fn, [n for _, n in self.kernel_tensors()] + self.kernel_sizes())
@@ -634,10 +640,8 @@ class Emitter:
         rows, cols = (_paren(e) for e in t.shape)
         w.blank()
         w.line('/* once every tile has finished, each tile checks its share of the rows */')
-        w.line('fsync_init();')
-        w.line('eu_fsync_init(0);')
-        w.line('fsync_sync_global();')
-        w.line('eu_fsync_wait(WFE);')
+        w.line('mg_fsync_init();')
+        w.line('mg_fsync_global(WFE);')
         w.blank()
         w.line(f'uint32_t share = ({rows} + NUM_HARTS - 1) / NUM_HARTS;')
         w.line(f'uint32_t r_end = (hartid + 1) * share < {rows} ? (hartid + 1) * share : {rows};')
@@ -693,14 +697,13 @@ PROLOGUE_SYNC = '''/**
  */
 uint32_t hartid = get_hartid();
 
-fsync_init();
 idma_init();
 redmule_init();
 
 eu_init();
 eu_redmule_init(0);
 eu_idma_init(0);
-eu_fsync_init(0);
+mg_fsync_init();
 
 uint32_t {y} = GET_Y_ID(hartid);
 uint32_t {x} = GET_X_ID(hartid);

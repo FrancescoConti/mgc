@@ -135,12 +135,15 @@ HWPES: Dict[str, Hwpe] = {
 # Software executors for L1 kernels
 # ----------------------------------------------------------------------------
 
-# CORE: the tile's CV32 control core, called synchronously. (Spatz / PULP
-# offload will be added as asynchronous executors once their mglib layer exists.)
-EXECUTORS = ('CORE',)
+# CORE: a function on the tile's CV32 control core, called synchronously.
+# SPATZ: the same, for a function that runs tasks on the tile's Spatz through mglib
+#   (mg_spatz_start/mg_spatz_run, or the SDK kernels' L1 APIs): the generated code
+#   sets Spatz up once, in its prologue (mg_spatz_init), before the first call.
+# (PULP offload will be added as an executor once its mglib layer exists.)
+EXECUTORS = ('CORE', 'SPATZ')
 
-# Synchronization scopes -> fsync calls
-SYNC = {'GLOBAL': 'fsync_sync_global', 'ROW': 'fsync_sync_row', 'COL': 'fsync_sync_col'}
+# Synchronization scopes -> mglib barriers
+SYNC = {'GLOBAL': 'mg_fsync_global', 'ROW': 'mg_fsync_row', 'COL': 'mg_fsync_col'}
 
 # ----------------------------------------------------------------------------
 # L1

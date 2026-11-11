@@ -24,6 +24,7 @@ u8, u16, u32, i32 = 'u8', 'u16', 'u32', 'i32'
 WFE = 'WFE'
 POLLING = 'POLLING'
 CORE = 'CORE'  # L1-kernel executor: the tile's CV32 control core
+SPATZ = 'SPATZ'  # L1-kernel executor: a core function that runs Spatz tasks (mglib mg_spatz)
 GLOBAL, ROW, COL = 'GLOBAL', 'ROW', 'COL'  # sync() / pipeline(sync=...) scopes
 GEMM, MATMUL = 'GEMM', 'MATMUL'  # redmule.enqueue(..., op=...): y += x @ w / z = x @ w
 
@@ -44,5 +45,5 @@ idma = _Ns()  # idma.load(dst, src), idma.store(dst, src)
 redmule = _Ns()  # gemm / matmul / enqueue / commit / start / commit_start / events
 
 __all__ = ['sizes', 'l2', 'define', 'test', 'top', 'kernel', 'l1_kernel', 'fp16', 'u8', 'u16', 'u32', 'i32', 'WFE', 'POLLING',
-           'CORE', 'GLOBAL', 'ROW', 'COL', 'GEMM', 'MATMUL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
+           'CORE', 'SPATZ', 'GLOBAL', 'ROW', 'COL', 'GEMM', 'MATMUL', 'tiles', 'pipeline', 'cores', 'check', 'comment', 'sync', 'rotate',
            'LAST', 'L1', 'idma', 'redmule']
