@@ -281,6 +281,32 @@ def _call_parts(node):
     return None, None
 
 
+_LICENSE = re.compile(r'Copyright|License|SPDX')
+_AUTHOR = re.compile(r'^[^<>#]+ <[^<>@\s]+@[^<>\s]+>$')
+
+
+def file_notice(src):
+    """The license and the authors of an .mgc file, from its leading block of `#` comment lines:
+    `(license, authors)`. The license is the first paragraph (up to a bare `#` line) if it mentions a
+    copyright or a license; the authors are the `Name <email>` lines. Either may be empty."""
+    paras, cur = [], []
+    for line in src.splitlines():
+        t = line.strip()
+        if not t.startswith('#'):
+            break
+        t = t[1:].strip()
+        if t:
+            cur.append(t)
+        elif cur:
+            paras.append(cur)
+            cur = []
+    if cur:
+        paras.append(cur)
+    license = paras[0] if paras and any(_LICENSE.search(t) for t in paras[0]) else []
+    authors = [t for p in paras for t in p if _AUTHOR.match(t)]
+    return license, authors
+
+
 class Frontend:
     """Translates one `.mgc` source into an `mg` IR module.
 
@@ -302,6 +328,7 @@ class Frontend:
         self.filename = filename
         self.tree = ast.parse(src, filename)
         self.comments = _comments(src)
+        self.license, self.file_authors = file_notice(src)
         self.cursor = 0
         self.hdefs, self.htext = parse_header(header)
         self.lasts = set()  # (id of block, name): `<var>_last` scalars declared after the loops so far
@@ -382,7 +409,9 @@ class Frontend:
                                   regions=[self.region(tl.body, top=True)])
         self.blocks.pop()
         fname = {'test': 'main', 'top': main.name, 'kernel': name}[kind]
-        attrs = {'kind': StringAttr(kind), 'fname': StringAttr(fname), 'authors': ir.strs(authors)}
+        authors = self.file_authors + [a for a in authors if a not in self.file_authors]
+        attrs = {'kind': StringAttr(kind), 'fname': StringAttr(fname), 'authors': ir.strs(authors),
+                 'license': ir.strs(self.license)}
         if kind == 'test':
             attrs['test'] = StringAttr(name)
         if kind == 'kernel':

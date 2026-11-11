@@ -246,7 +246,8 @@ class FuncOp(_Region):
     sizes = opt_attr_def(ArrayAttr)  # size macros, the trailing arguments (kind == 'kernel')
     check = opt_attr_def(ArrayAttr)  # result and golden L2 arrays of the generated test (kind == 'kernel')
     tol = opt_attr_def(IntAttr)
-    authors = attr_def(ArrayAttr)
+    authors = attr_def(ArrayAttr)  # the `Name <email>` lines of the .mgc header, then those of `authors=`
+    license = opt_attr_def(ArrayAttr)  # the license paragraph of the .mgc header
     doc = opt_attr_def(StringAttr)
     body = region_def()
 
