@@ -180,7 +180,7 @@ class Systolic(unittest.TestCase):
         self.assertLess(wx, enq)
         self.assertEqual(c[c.rfind('if (pt', 0, wx):].split('\n')[0], 'if (pt < timeslots) {')
         self.assertLess(c.index('mg_redmule_gemm_commit_start'), c.index('mg_redmule_wait(WAIT_MODE, &redmule_evt);'))
-        self.assertEqual(c.count('fsync_sync_global();'), 2)  # prologue + every step
+        self.assertEqual(c.count('mg_fsync_global(WAIT_MODE);'), 2)  # prologue + every step
 
     def test_remote_store_and_uniform_layout(self):
         c = _c(WS, 'mm_ws.mgc')
@@ -195,8 +195,8 @@ class Systolic(unittest.TestCase):
     def test_is_east_and_row_barrier(self):
         c = _c(IS, 'mm_is.mgc')
         self.assertIn('uint32_t l1_base_e = get_l1_base(hartid + 1);', c)
-        self.assertIn('fsync_sync_row();', c)
-        self.assertNotIn('fsync_sync_global', c)
+        self.assertIn('mg_fsync_row(WAIT_MODE);', c)
+        self.assertNotIn('mg_fsync_global', c)
 
     def test_event_storage_split_only_when_overlapping(self):
         ws = _c(WS, 'mm_ws.mgc')  # y is loaded (top row) one step ahead, while the previous block is sent
@@ -251,6 +251,15 @@ class Kernels(unittest.TestCase):
         c = _c(L1K, 'mm_os_l1k.mgc')
         self.assertIn('extern void l1_copy_fp16(uint32_t dst, uint32_t src, uint32_t p0);', c)
         self.assertIn('l1_copy_fp16(x_pt, x_raw_pt, tile_h * t_size);', c)
+
+    def test_spatz_executor_sets_spatz_up_once(self):
+        c = _c(L1K, 'mm_os_l1k.mgc')
+        self.assertNotIn('mg_spatz', c)
+        c = _c(L1K, 'x.mgc', _read(L1K, 'mm_os_l1k.mgc').replace('executor=CORE', 'executor=SPATZ'))
+        self.assertIn('#include "mg_spatz.h"', c)
+        self.assertEqual(c.count('mg_spatz_init();'), 1)
+        self.assertLess(c.index('mg_spatz_init();'), c.index('l1_copy_fp16(x_pt'))
+        self.assertIn('/** L1 kernel (SPATZ): all pointers are L1 addresses. */', c)
 
     def test_kernel_overlaps_previous_job(self):
         # job i is programmed before the CV32 copy that produces its input and committed
@@ -960,7 +969,7 @@ def main():
 
     def test_sync_in_stage(self):
         c = self.c(('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'))
-        self.assertIn('fsync_sync_row();', c)
+        self.assertIn('mg_fsync_row(WAIT_MODE);', c)
         self.assertError([('                ev[i].wait()\n', '                ev[i].wait()\n                sync(ROW)\n'),
                           ('pipeline(steps)', 'pipeline(tile_w.size)')], 'same on every tile')
 
