@@ -6,9 +6,9 @@
 # Francesco Conti <f.conti@unibo.it>
 """mgcc - compile an mgc ("magic") test description into mglib C.
 
-    mgcc.py tests/magia/mgc/mm_os_mgc/mm_os.mgc -o tests/magia/mgc/mm_os_mgc/src/test.c
-    mgcc.py kernels/mgc/mm_os/mm_os.mgc --header tests/magia/mgc/mm_os/include/test.h \
-        -o kernels/mgc/mm_os/src/mgc_mm_os.c --test tests/magia/mgc/mm_os/src/test.c   # a @kernel
+    mgcc.py kernels/mgc/mm_os/mm_os.mgc --header tests/magia/mgc/mm_os_mgc/include/test.h \
+        -o kernels/mgc/mm_os/src/mgc_mm_os.c --test tests/magia/mgc/mm_os_mgc/src/test.c   # a @kernel
+    mgcc.py tests/data/mm_os_l1k/mm_os_l1k.mgc -o test.c                                 # a @test
     mgcc.py mm_os.mgc --print-ir-after=pipeline     # inspect the IR after a pass
     mgcc.py mm_os.mgc --print-ir-after-all
 
