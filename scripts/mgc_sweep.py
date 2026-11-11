@@ -1122,7 +1122,7 @@ def run_one(t, cfg, tiles, hw, row, rdir, t0, tag, args, rep, free, out, tests):
         if t.needs_regen(cfg, tiles) or l1:
             why = generate(ts, cfg, tiles, args, rep.log, l1)
         else:
-            why = mgcc(ts, tiles, args, os.devnull, rep.log)  # committed test.c: only check that it fits L1
+            why = mgcc(ts, tiles, args, rep.log)  # the committed sizes: compiled in the mirror, checking that it fits L1
         if why:
             row['status'] = 'SKIP'
             rep.log('%s skipped: %s' % (tag, why))
