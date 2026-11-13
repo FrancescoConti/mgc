@@ -17,9 +17,10 @@ built and simulated in parallel, each in a job slot <out>/jobs/<k>/ with its own
 GVSOC_WORK_DIR and mirror of the SDK (sdk/: the test folders and tile_config.h copied, every other
 entry a link to the SDK), in which its sources are generated and built: the SDK is never written.
 The golden data of all the configurations are generated first, J at a time, into the cache. Metrics:
-  - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
-    without crt0 init and without tile 0's final check(); for mm and conv tests, where each tile
-    checks its own output tile, to the end of the last iDMA store (L1->L2)
+  - cycles: from tile 0's entry in main to the end of the last iDMA store (L1->L2) of any tile,
+    the last write of the kernel's output, i.e. without crt0 init and without the check of the
+    results, which follows it (on tile 0 only, or on every tile, which checks its own share);
+    at the latest the exit of the last tile other than tile 0
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
     plus the Q, Kt, V and output projections), 2*S*S*P*H + 2*S*D*P*H + 2*S*D*P*HKV for gqa,
@@ -313,6 +314,8 @@ class Test:
             return 'H must be a multiple of HKV'
         if cfg['H_NB'] and cfg['H'] % cfg['H_NB']:
             return 'H must be a multiple of H_NB'
+        if cfg['H_NB'] and cfg['HKV'] and cfg['HKV'] % cfg['H_NB']:
+            return 'HKV must be a multiple of H_NB'
         if cfg['PRJ_NB'] and (cfg['S'] % cfg['PRJ_NB'] or cfg['S'] // cfg['PRJ_NB'] < tiles):
             return 'S must be a multiple of PRJ_NB, with at least tiles rows per block'
         if self.kind in ('flat_attn', 'mhsa', 'gqa'):
@@ -438,6 +441,8 @@ def generate_golden(test, cfg, tiles, args, log, l1=None):
         elif test.kind == 'ffn':
             cmd = [args.gen_python, test.gen, '--s_size', cfg['S'], '--e_size', cfg['D'], '--i_size', cfg['I'],
                    '--tiles', tiles, '--inc_dir', tmp]
+            if cfg['PRJ_NB'] and test.defaults['PRJ_NB'] is not None:  # FFN kernels with row blocking (ffn_swiglu)
+                cmd += ['--prj_nb', cfg['PRJ_NB']]
         elif test.kind == 'mm':
             cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', tmp]
         elif test.kind == 'conv':
@@ -956,10 +961,12 @@ def analyze(test, trace, kills, n_tiles, build, light, tp_bin=None):
                           % tracks[(0, 'cv32-core.function')])).as_pandas_dataframe().t[0]
         others = [c for t, c in kills.items() if t != 0] or list(kills.values())
         lo, hi = int(main0), max(others) * CYCLE_NS
-        if test.kind in ('mm', 'conv'):
-            # every tile checks its own output tile after storing it: end at the last store
-            stores = [slices(t, 'idma-obi2axi.be.busy') for t in range(n_tiles)]
-            hi = min(hi, max(int(s[:, 1].max()) for s in stores if len(s)))
+        # the check of the results (by tile 0, or by every tile on its share) follows the kernel's last store of
+        # its output (L1->L2) and is never counted: end at the last store of any tile
+        stores = [slices(t, 'idma-obi2axi.be.busy') for t in range(n_tiles)]
+        stores = [s for s in stores if len(s)]
+        if stores:
+            hi = min(hi, max(int(s[:, 1].max()) for s in stores))
 
         # Spatz busy: Snitch PC outside the runtime's idle code (dispatcher, traps, boot)
         idle, (base, end) = spatz_idle_pcs(test, build) if test.spatz_name else ([], (0, 0))
@@ -1080,7 +1087,11 @@ def expand(groups, tests):
                 sys.exit('unknown test %r (see --list)' % name)
             t = tests[name]
             app = t.applicable()
-            values = [g.get(p) or [AUTO if p in OUTER_BLOCKS + ATT_BLOCKS else t.defaults[p]] for p in app]
+            # blocking not given: chosen to fit L1 (AUTO), except for the FFN tests, whose golden generator sizes their
+            # chunks for the L1 (the fit check of the .mgc with the committed test.h would use the chunks of its default
+            # sizes): their PRJ_NB stays at the test's default unless the sweep gives it
+            values = [g.get(p) or [AUTO if p in OUTER_BLOCKS + ATT_BLOCKS and t.kind != 'ffn' else t.defaults[p]]
+                      for p in app]
             values = [v if isinstance(v, list) else [v] for v in values]
             for tiles in g['tiles']:
                 for hw_combo in itertools.product(*hw_values):
@@ -1254,7 +1265,12 @@ def main():
     if args.jobs < 1:
         ap.error('--jobs must be at least 1')
 
-    tests = {n: Test(n) for n in list_tests()}
+    tests = {}
+    for n in list_tests():
+        try:
+            tests[n] = Test(n)
+        except FileNotFoundError as e:  # not converted to a kernels/mgc_kernels kernel yet
+            print('mgc_sweep: skipping %s (%s not found)' % (n, e.filename), file=sys.stderr)
     if args.list:
         for t in tests.values():
             d = ' '.join('%s=%s' % (p, t.defaults[p]) for p in t.applicable())
