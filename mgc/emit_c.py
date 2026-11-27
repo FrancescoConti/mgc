@@ -635,7 +635,6 @@ class Emitter:
         w.blank()
         w.line('/* once every tile has finished, each tile checks its share of the rows */')
         w.line('fsync_init();')
-        w.line('eu_fsync_init(0);')
         w.line('fsync_sync_global();')
         w.line('eu_fsync_wait(WFE);')
         w.blank()
@@ -679,8 +678,6 @@ idma_init();
 redmule_init();
 
 eu_init();
-eu_redmule_init(0);
-eu_idma_init(0);
 
 uint32_t {y} = GET_Y_ID(hartid);
 uint32_t {x} = GET_X_ID(hartid);
@@ -698,9 +695,6 @@ idma_init();
 redmule_init();
 
 eu_init();
-eu_redmule_init(0);
-eu_idma_init(0);
-eu_fsync_init(0);
 
 uint32_t {y} = GET_Y_ID(hartid);
 uint32_t {x} = GET_X_ID(hartid);
